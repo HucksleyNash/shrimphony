@@ -119,14 +119,21 @@ class _AppRoot extends StatelessWidget {
         return _LoginScreen(controller: controller);
       }
       final hasLibrary =
-          controller.albums.isNotEmpty || controller.songs.isNotEmpty;
+          controller.albums.isNotEmpty ||
+          controller.songs.isNotEmpty ||
+          controller.downloads.isNotEmpty ||
+          controller.playlists.isNotEmpty;
       if (controller.status == AppStatus.loading && !hasLibrary) {
         return const _LoadingScreen(label: 'Loading your music…');
       }
       if (controller.status == AppStatus.error && !hasLibrary) {
         return _ConnectionError(controller: controller);
       }
-      return _AppShell(controller: controller, audioHandler: audioHandler);
+      return _AppShell(
+        key: ValueKey(controller.session?.deviceId),
+        controller: controller,
+        audioHandler: audioHandler,
+      );
     },
   );
 }
@@ -207,7 +214,7 @@ class _LoginScreenState extends State<_LoginScreen> {
       builder: (context) => AlertDialog(
         title: const Text('Remove server?'),
         content: Text(
-          'Remove ${Uri.parse(server.serverUrl).host} for ${server.username}?',
+          'Remove ${Uri.parse(server.serverUrl).host} for ${server.username}, including its downloaded music, artwork, cached library, and preferences?',
         ),
         actions: [
           TextButton(
@@ -224,7 +231,16 @@ class _LoginScreenState extends State<_LoginScreen> {
     if (confirmed != true || !mounted) return;
     final wasEditing =
         widget.controller.editingServer?.deviceId == server.deviceId;
-    await widget.controller.removeServer(server);
+    try {
+      await widget.controller.removeServer(server);
+    } on Object catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not remove server: $error')),
+        );
+      }
+      return;
+    }
     if (wasEditing && mounted) _cancelServerEdit();
   }
 
@@ -237,6 +253,7 @@ class _LoginScreenState extends State<_LoginScreen> {
   }
 
   Future<void> _login() async {
+    if (widget.controller.status == AppStatus.loading) return;
     if (!_formKey.currentState!.validate()) return;
     FocusScope.of(context).unfocus();
     await widget.controller.login(
@@ -535,7 +552,11 @@ class _ConnectionError extends StatelessWidget {
 }
 
 class _AppShell extends StatefulWidget {
-  const _AppShell({required this.controller, required this.audioHandler});
+  const _AppShell({
+    super.key,
+    required this.controller,
+    required this.audioHandler,
+  });
 
   final AppController controller;
   final JellyfinAudioHandler audioHandler;
@@ -546,6 +567,29 @@ class _AppShell extends StatefulWidget {
 
 class _AppShellState extends State<_AppShell> {
   int _index = 0;
+  StreamSubscription<dynamic>? _events;
+
+  @override
+  void initState() {
+    super.initState();
+    _events = widget.audioHandler.customEvent.listen((event) {
+      if (!mounted || event is! Map || event['type'] == 'reportingError') {
+        return;
+      }
+      final message = event['message'];
+      if (message is String) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(message)));
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _events?.cancel();
+    super.dispose();
+  }
 
   Future<void> _logout() async {
     final confirmed = await showDialog<bool>(
@@ -553,7 +597,7 @@ class _AppShellState extends State<_AppShell> {
       builder: (context) => AlertDialog(
         title: const Text('Sign out?'),
         content: const Text(
-          'This removes this saved server and clears the playback queue.',
+          'This removes this saved server, its downloads and cached data, and the playback queue.',
         ),
         actions: [
           TextButton(
@@ -573,10 +617,24 @@ class _AppShellState extends State<_AppShell> {
   @override
   Widget build(BuildContext context) {
     final titles = ['Home', 'Search', 'Your Library'];
+    final compact = MediaQuery.sizeOf(context).height < 450;
+    final offline = widget.controller.status == AppStatus.error;
     return Scaffold(
       appBar: AppBar(
-        title: Text(titles[_index]),
+        title: Text(
+          '${titles[_index]}${compact && offline ? ' · Offline' : ''}',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
         actions: [
+          if (compact &&
+              (widget.controller.downloadQueue.isNotEmpty ||
+                  widget.controller.failedDownloads.isNotEmpty))
+            IconButton(
+              tooltip: 'Manage downloads',
+              onPressed: () => _showDownloadQueue(context, widget.controller),
+              icon: const Icon(Icons.download),
+            ),
           IconButton(
             tooltip: 'Refresh library',
             onPressed: widget.controller.status == AppStatus.loading
@@ -593,13 +651,7 @@ class _AppShellState extends State<_AppShell> {
             tooltip: 'More options',
             onSelected: (value) async {
               if (value == 'shuffle') {
-                await _runPlayback(
-                  context,
-                  () => widget.audioHandler.playItems(
-                    widget.controller.songs,
-                    shuffle: true,
-                  ),
-                );
+                await _runPlayback(context, widget.audioHandler.shuffleLibrary);
               } else if (value == 'settings') {
                 await Navigator.push(
                   context,
@@ -640,7 +692,7 @@ class _AppShellState extends State<_AppShell> {
       ),
       body: Column(
         children: [
-          if (widget.controller.status == AppStatus.error)
+          if (offline && !compact)
             MaterialBanner(
               content: Text(
                 widget.controller.errorMessage ?? 'Server unavailable.',
@@ -653,9 +705,10 @@ class _AppShellState extends State<_AppShell> {
                 ),
               ],
             ),
-          if (widget.controller.downloadingItem != null ||
-              widget.controller.downloadQueue.isNotEmpty ||
-              widget.controller.downloadError != null)
+          if (!compact &&
+              (widget.controller.downloadingItem != null ||
+                  widget.controller.downloadQueue.isNotEmpty ||
+                  widget.controller.downloadError != null))
             _DownloadStatusBar(controller: widget.controller),
           Expanded(
             child: IndexedStack(
@@ -736,7 +789,9 @@ class _DownloadStatusBar extends StatelessWidget {
                     ),
               title: Text(
                 current == null
-                    ? 'Download failed'
+                    ? controller.downloadsPaused
+                          ? 'Downloads paused'
+                          : 'Downloads need attention'
                     : 'Downloading ${current.name}',
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
@@ -752,7 +807,14 @@ class _DownloadStatusBar extends StatelessWidget {
               trailing: const Icon(Icons.chevron_right),
               onTap: () => _showDownloadQueue(context, controller),
             ),
-            if (current != null) const LinearProgressIndicator(),
+            if (current != null)
+              LinearProgressIndicator(
+                value: (controller.downloadTotalBytes ?? 0) > 0
+                    ? (controller.downloadReceivedBytes /
+                              controller.downloadTotalBytes!)
+                          .clamp(0, 1)
+                    : null,
+              ),
           ],
         ),
       ),
@@ -774,6 +836,8 @@ class _SettingsScreenState extends State<_SettingsScreen> {
   late bool _allLibraries;
   late Set<String> _selectedLibraries;
   late StreamingQuality _quality;
+  late bool _wifiOnly;
+  late int _downloadLimit;
   bool _saving = false;
 
   @override
@@ -783,6 +847,8 @@ class _SettingsScreenState extends State<_SettingsScreen> {
     _selectedLibraries = {...preferences.musicLibraryIds};
     _allLibraries = _selectedLibraries.isEmpty;
     _quality = preferences.streamingQuality;
+    _wifiOnly = preferences.wifiOnlyDownloads;
+    _downloadLimit = preferences.downloadLimitBytes;
   }
 
   Future<void> _save() async {
@@ -798,6 +864,8 @@ class _SettingsScreenState extends State<_SettingsScreen> {
         AppPreferences(
           musicLibraryIds: _allLibraries ? const {} : _selectedLibraries,
           streamingQuality: _quality,
+          wifiOnlyDownloads: _wifiOnly,
+          downloadLimitBytes: _downloadLimit,
         ),
       );
       if (mounted) Navigator.pop(context);
@@ -828,6 +896,7 @@ class _SettingsScreenState extends State<_SettingsScreen> {
         const SizedBox(height: 12),
         DropdownButtonFormField<StreamingQuality>(
           initialValue: _quality,
+          isExpanded: true,
           decoration: const InputDecoration(
             labelText: 'Streaming quality',
             prefixIcon: Icon(Icons.high_quality_outlined),
@@ -878,6 +947,125 @@ class _SettingsScreenState extends State<_SettingsScreen> {
           leading: const Icon(Icons.download_done_rounded),
           title: Text('${widget.controller.downloads.length} downloaded songs'),
           subtitle: Text(_formatBytes(widget.controller.downloadedBytes)),
+        ),
+        SwitchListTile(
+          title: const Text('Download only on Wi-Fi'),
+          value: _wifiOnly,
+          onChanged: _saving
+              ? null
+              : (value) => setState(() => _wifiOnly = value),
+        ),
+        DropdownButtonFormField<int>(
+          initialValue: _downloadLimit,
+          isExpanded: true,
+          decoration: const InputDecoration(
+            labelText: 'Download storage limit',
+          ),
+          items: [
+            for (final bytes in {
+              0,
+              1073741824,
+              5368709120,
+              10737418240,
+              _downloadLimit,
+            })
+              DropdownMenuItem(
+                value: bytes,
+                child: Text(bytes == 0 ? 'No limit' : _formatBytes(bytes)),
+              ),
+          ],
+          onChanged: _saving
+              ? null
+              : (value) => setState(() => _downloadLimit = value ?? 0),
+        ),
+        ListTile(
+          leading: const Icon(Icons.download_rounded),
+          title: const Text('Manage downloads'),
+          onTap: () => _showDownloadQueue(context, widget.controller),
+        ),
+        ListTile(
+          leading: const Icon(Icons.delete_outline),
+          title: const Text('Remove all downloads'),
+          onTap: () async {
+            final confirmed = await showDialog<bool>(
+              context: context,
+              builder: (context) => AlertDialog(
+                title: const Text('Remove all downloads?'),
+                content: const Text(
+                  'This cancels pending downloads and removes this account’s offline music and artwork. Your server library stays available.',
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(context, false),
+                    child: const Text('Cancel'),
+                  ),
+                  FilledButton(
+                    onPressed: () => Navigator.pop(context, true),
+                    child: const Text('Remove'),
+                  ),
+                ],
+              ),
+            );
+            if (confirmed != true) return;
+            try {
+              await widget.controller.clearDownloads();
+              if (mounted) setState(() {});
+            } on Object catch (error) {
+              if (context.mounted) {
+                ScaffoldMessenger.of(
+                  context,
+                ).showSnackBar(SnackBar(content: Text('$error')));
+              }
+            }
+          },
+        ),
+        const SizedBox(height: 28),
+        ListTile(
+          leading: const Icon(Icons.info_outline),
+          title: const Text('About Shrimphony'),
+          onTap: () => showAboutDialog(
+            context: context,
+            applicationName: appName,
+            applicationVersion: appVersion,
+            children: [const Text('Independent Jellyfin music player.')],
+          ),
+        ),
+        ListTile(
+          leading: const Icon(Icons.privacy_tip_outlined),
+          title: const Text('Privacy'),
+          onTap: () => showDialog<void>(
+            context: context,
+            builder: (context) => AlertDialog(
+              title: const Text('Privacy'),
+              content: const SingleChildScrollView(
+                child: SelectableText(
+                  'Shrimphony connects directly to your Jellyfin server. The server receives sign-in requests, library queries and playback reports. Your password is not saved. Tokens are kept in secure device storage.\n\n'
+                  'Music, artwork, preferences and queued downloads are stored on this device. There are no advertising, analytics or tracking services. Offline playback reports are not replayed later.\n\n'
+                  'Remove a server or sign out to erase that account’s local data. Remove all downloads in Settings to clear offline files. Your Jellyfin administrator controls server-side data.',
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('Close'),
+                ),
+              ],
+            ),
+          ),
+        ),
+        ListTile(
+          leading: const Icon(Icons.description_outlined),
+          title: const Text('Open-source licenses'),
+          onTap: () => showLicensePage(
+            context: context,
+            applicationName: appName,
+            applicationVersion: appVersion,
+          ),
+        ),
+        ListTile(
+          leading: const Icon(Icons.support_agent),
+          title: const Text('Support and diagnostics'),
+          onTap: () => _showSupport(context, widget.controller),
         ),
         const SizedBox(height: 28),
         Text('Connection', style: Theme.of(context).textTheme.titleLarge),
@@ -952,7 +1140,15 @@ class _HomePage extends StatelessWidget {
             controller: controller,
             audioHandler: audioHandler,
           ),
-        if (controller.recentlyAdded.isEmpty && controller.albums.isEmpty)
+        _HorizontalSection(
+          title: 'Downloaded music',
+          items: controller.downloadedCatalog,
+          controller: controller,
+          audioHandler: audioHandler,
+        ),
+        if (controller.recentlyAdded.isEmpty &&
+            controller.albums.isEmpty &&
+            controller.downloads.isEmpty)
           const _EmptyState(
             icon: Icons.music_off_outlined,
             title: 'No music found',
@@ -993,7 +1189,7 @@ class _HorizontalSection extends StatelessWidget {
           ),
           const SizedBox(height: 12),
           SizedBox(
-            height: 212,
+            height: 148 + 64 * MediaQuery.textScalerOf(context).scale(1),
             child: ListView.separated(
               scrollDirection: Axis.horizontal,
               itemCount: shown.length,
@@ -1247,15 +1443,27 @@ class _LibraryPageState extends State<_LibraryPage> {
   String _sort = 'A–Z';
 
   List<JellyfinItem> get _items {
+    final offline = widget.controller.status == AppStatus.error;
+    final local = widget.controller.downloadedCatalog;
     final items = [
       ...switch (_filter) {
-        'Artists' => widget.controller.artists,
-        'Songs' => widget.controller.songs,
-        'Playlists' => widget.controller.playlists,
+        'Artists' =>
+          offline
+              ? local.where((item) => item.isArtist)
+              : widget.controller.artists,
+        'Songs' =>
+          offline ? widget.controller.downloads : widget.controller.songs,
+        'Playlists' =>
+          offline
+              ? local.where((item) => item.isPlaylist)
+              : widget.controller.playlists,
         'Favorites' => widget.controller.favorites,
         'Genres' => widget.controller.genres,
-        'Downloads' => widget.controller.downloads,
-        _ => widget.controller.albums,
+        'Downloads' => widget.controller.downloadedCatalog,
+        _ =>
+          offline
+              ? local.where((item) => item.isAlbum)
+              : widget.controller.albums,
       },
     ];
     items.sort(switch (_sort) {
@@ -1310,10 +1518,8 @@ class _LibraryPageState extends State<_LibraryPage> {
                 IconButton.filledTonal(
                   tooltip: 'Shuffle songs',
                   icon: const Icon(Icons.shuffle),
-                  onPressed: () => _runPlayback(
-                    context,
-                    () => widget.audioHandler.playItems(items, shuffle: true),
-                  ),
+                  onPressed: () =>
+                      _runPlayback(context, widget.audioHandler.shuffleLibrary),
                 ),
               if (_filter == 'Playlists')
                 IconButton.filledTonal(
@@ -1728,7 +1934,9 @@ class _MiniPlayer extends StatelessWidget {
             ),
           ),
           child: SizedBox(
-            height: 66,
+            height: MediaQuery.sizeOf(context).height < 450
+                ? 66
+                : 66 * MediaQuery.textScalerOf(context).scale(1).clamp(1, 2),
             child: Row(
               children: [
                 Padding(
@@ -1746,12 +1954,13 @@ class _MiniPlayer extends StatelessWidget {
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(fontWeight: FontWeight.w600),
                       ),
-                      Text(
-                        item.artist ?? item.album ?? '',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
+                      if (MediaQuery.sizeOf(context).height >= 450)
+                        Text(
+                          item.artist ?? item.album ?? '',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
                     ],
                   ),
                 ),
@@ -1760,13 +1969,27 @@ class _MiniPlayer extends StatelessWidget {
                   initialData: audioHandler.playbackState.value,
                   builder: (context, state) {
                     final playing = state.data?.playing ?? false;
+                    final failed =
+                        state.data?.processingState ==
+                        AudioProcessingState.error;
                     return IconButton(
-                      tooltip: playing ? 'Pause' : 'Play',
-                      onPressed: playing
+                      tooltip: failed
+                          ? 'Retry playback'
+                          : playing
+                          ? 'Pause'
+                          : 'Play',
+                      onPressed: failed
+                          ? () => _runPlayback(
+                              context,
+                              audioHandler.retryPlayback,
+                            )
+                          : playing
                           ? audioHandler.pause
                           : audioHandler.play,
                       icon: Icon(
-                        playing
+                        failed
+                            ? Icons.refresh
+                            : playing
                             ? Icons.pause_rounded
                             : Icons.play_arrow_rounded,
                       ),
@@ -1955,9 +2178,55 @@ class _NowPlayingScreen extends StatelessWidget {
                             builder: (context, stateSnapshot) {
                               final state =
                                   stateSnapshot.data ?? PlaybackState();
-                              return _TransportControls(
-                                state: state,
-                                audioHandler: audioHandler,
+                              return Column(
+                                children: [
+                                  if (state.processingState ==
+                                      AudioProcessingState.error)
+                                    Semantics(
+                                      liveRegion: true,
+                                      child: Column(
+                                        children: [
+                                          Text(
+                                            state.errorMessage ??
+                                                'Playback failed.',
+                                          ),
+                                          Wrap(
+                                            spacing: 12,
+                                            children: [
+                                              FilledButton.icon(
+                                                onPressed: () => _runPlayback(
+                                                  context,
+                                                  audioHandler.retryPlayback,
+                                                ),
+                                                icon: const Icon(Icons.refresh),
+                                                label: const Text(
+                                                  'Retry playback',
+                                                ),
+                                              ),
+                                              TextButton(
+                                                onPressed: () => _runPlayback(
+                                                  context,
+                                                  audioHandler.skipToNext,
+                                                ),
+                                                child: const Text('Skip song'),
+                                              ),
+                                            ],
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  if (state.processingState ==
+                                          AudioProcessingState.loading ||
+                                      state.processingState ==
+                                          AudioProcessingState.buffering)
+                                    const LinearProgressIndicator(
+                                      semanticsLabel: 'Buffering audio',
+                                    ),
+                                  _TransportControls(
+                                    state: state,
+                                    audioHandler: audioHandler,
+                                  ),
+                                ],
                               );
                             },
                           ),
@@ -2195,6 +2464,12 @@ class _Artwork extends StatelessWidget {
           dimension: size,
           child: client == null || artworkId == null
               ? const _ArtworkPlaceholder()
+              : controller.artworkUris[artworkId] != null
+              ? Image.file(
+                  File.fromUri(controller.artworkUris[artworkId]!),
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, _, _) => const _ArtworkPlaceholder(),
+                )
               : Image.network(
                   client.imageUri(artworkId, width: size.ceil()).toString(),
                   headers: client.authorizationHeaders,
@@ -2216,7 +2491,7 @@ class _MediaArtwork extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final remote = item.extras?['remoteArtUri'];
+    final remote = item.extras?['localArtUri'] ?? item.extras?['remoteArtUri'];
     final artwork = remote is String ? Uri.tryParse(remote) : item.artUri;
     return Semantics(
       image: true,
@@ -2227,6 +2502,12 @@ class _MediaArtwork extends StatelessWidget {
           dimension: size,
           child: artwork == null
               ? const _ArtworkPlaceholder()
+              : artwork.scheme == 'file'
+              ? Image.file(
+                  File.fromUri(artwork),
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, _, _) => const _ArtworkPlaceholder(),
+                )
               : Image.network(
                   artwork.toString(),
                   headers: item.artHeaders,
@@ -2532,7 +2813,7 @@ Future<void> _downloadItems(
       .where((item) => !controller.isDownloaded(item.id))
       .toList();
   if (pending.isEmpty) return;
-  final queued = controller.enqueueDownloads(pending);
+  final queued = await controller.enqueueDownloads(pending);
   if (!context.mounted) return;
   ScaffoldMessenger.of(context).showSnackBar(
     SnackBar(
@@ -2606,6 +2887,32 @@ Future<void> _showDownloadQueue(
                   ],
                 ),
               ),
+              Wrap(
+                spacing: 8,
+                children: [
+                  TextButton(
+                    onPressed: controller.downloadsPaused
+                        ? controller.resumeDownloads
+                        : controller.pauseDownloads,
+                    child: Text(
+                      controller.downloadsPaused
+                          ? 'Resume downloads'
+                          : 'Pause downloads',
+                    ),
+                  ),
+                  if (controller.failedDownloads.isNotEmpty)
+                    TextButton(
+                      onPressed: controller.retryDownloads,
+                      child: const Text('Retry failed downloads'),
+                    ),
+                ],
+              ),
+              const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 24),
+                child: Text(
+                  'Pending songs are saved. Reopen Shrimphony to continue after the system closes the app.',
+                ),
+              ),
               if (controller.downloadError case final error?)
                 ListTile(
                   leading: Icon(
@@ -2622,19 +2929,45 @@ Future<void> _showDownloadQueue(
                     child: CircularProgressIndicator(strokeWidth: 2.5),
                   ),
                   title: Text(current.name),
-                  subtitle: const Text('Downloading for offline play'),
+                  subtitle: Text(
+                    '${_formatBytes(controller.downloadReceivedBytes)} received',
+                  ),
+                  trailing: IconButton(
+                    tooltip: 'Cancel ${current.name}',
+                    icon: const Icon(Icons.close),
+                    onPressed: () => controller.cancelDownload(current.id),
+                  ),
                 ),
               for (
                 var index = 0;
                 index < controller.downloadQueue.length;
                 index++
               )
+                if (controller.downloadQueue[index].id != current?.id)
+                  ListTile(
+                    leading: CircleAvatar(child: Text('${index + 1}')),
+                    title: Text(controller.downloadQueue[index].name),
+                    subtitle: const Text('Waiting'),
+                    trailing: IconButton(
+                      tooltip: 'Cancel ${controller.downloadQueue[index].name}',
+                      icon: const Icon(Icons.close),
+                      onPressed: () => controller.cancelDownload(
+                        controller.downloadQueue[index].id,
+                      ),
+                    ),
+                  ),
+              for (final item in controller.failedDownloads)
                 ListTile(
-                  leading: CircleAvatar(child: Text('${index + 1}')),
-                  title: Text(controller.downloadQueue[index].name),
-                  subtitle: const Text('Waiting'),
+                  title: Text(item.name),
+                  subtitle: const Text('Failed — retry available'),
+                  trailing: IconButton(
+                    tooltip: 'Cancel ${item.name}',
+                    icon: const Icon(Icons.close),
+                    onPressed: () => controller.cancelDownload(item.id),
+                  ),
                 ),
               if (current == null &&
+                  controller.failedDownloads.isEmpty &&
                   controller.downloadQueue.isEmpty &&
                   controller.downloadError == null)
                 const ListTile(
@@ -2901,4 +3234,43 @@ String _formatBytes(int value) {
     return '${(value / (1024 * 1024)).toStringAsFixed(1)} MB';
   }
   return '${(value / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
+}
+
+Future<void> _showSupport(
+  BuildContext context,
+  AppController controller,
+) async {
+  final diagnostics =
+      '$appName $appVersion\nPlatform: ${Platform.operatingSystem}\n'
+      'Library status: ${controller.status.name}\nSongs: ${controller.songs.length}\n'
+      'Downloads: ${controller.downloads.length}\nPending downloads: ${controller.downloadQueue.length}';
+  const support = String.fromEnvironment('SUPPORT_URL');
+  await showDialog<void>(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: const Text('Support and diagnostics'),
+      content: SingleChildScrollView(
+        child: SelectableText(
+          '$diagnostics\n\n${support.isEmpty ? 'Support contact has not been configured for this development build.' : support}\n\nInclude what happened and steps to reproduce. Never share your password or access token.',
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Clipboard.setData(ClipboardData(text: diagnostics)),
+          child: const Text('Copy diagnostics'),
+        ),
+        if (support.isNotEmpty)
+          TextButton(
+            onPressed: () => const MethodChannel(
+              'com.thomaskleckner.shrimphony/links',
+            ).invokeMethod<void>('open', {'url': support}),
+            child: const Text('Contact support'),
+          ),
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Close'),
+        ),
+      ],
+    ),
+  );
 }

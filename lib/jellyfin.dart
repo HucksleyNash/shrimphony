@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path_provider/path_provider.dart';
 
@@ -34,25 +35,40 @@ class AppPreferences {
   const AppPreferences({
     this.musicLibraryIds = const {},
     this.streamingQuality = StreamingQuality.original,
+    this.downloadLimitBytes = 0,
+    this.wifiOnlyDownloads = false,
   });
 
   final Set<String> musicLibraryIds;
   final StreamingQuality streamingQuality;
+  final int downloadLimitBytes;
+  final bool wifiOnlyDownloads;
 
   AppPreferences copyWith({
     Set<String>? musicLibraryIds,
     StreamingQuality? streamingQuality,
+    int? downloadLimitBytes,
+    bool? wifiOnlyDownloads,
   }) => AppPreferences(
     musicLibraryIds: musicLibraryIds ?? this.musicLibraryIds,
     streamingQuality: streamingQuality ?? this.streamingQuality,
+    downloadLimitBytes: downloadLimitBytes ?? this.downloadLimitBytes,
+    wifiOnlyDownloads: wifiOnlyDownloads ?? this.wifiOnlyDownloads,
   );
 
   Map<String, dynamic> toJson() => {
     'musicLibraryIds': musicLibraryIds.toList(),
     'streamingQuality': streamingQuality.name,
+    'downloadLimitBytes': downloadLimitBytes,
+    'wifiOnlyDownloads': wifiOnlyDownloads,
   };
 
   factory AppPreferences.fromJson(Map<String, dynamic> json) => AppPreferences(
+    downloadLimitBytes: max(
+      0,
+      (json['downloadLimitBytes'] as num?)?.toInt() ?? 0,
+    ),
+    wifiOnlyDownloads: json['wifiOnlyDownloads'] == true,
     musicLibraryIds: (json['musicLibraryIds'] as List? ?? const [])
         .whereType<String>()
         .toSet(),
@@ -140,6 +156,9 @@ class JellyfinItem {
     required this.id,
     required this.name,
     required this.type,
+    this.sortName,
+    this.albumArtist,
+    this.genreNames = const [],
     this.album,
     this.albumId,
     this.albumImageTag,
@@ -156,12 +175,17 @@ class JellyfinItem {
     this.lastPlayedDate,
     this.playbackPosition = Duration.zero,
     this.container,
+    this.mediaSourceId,
+    this.audioBitDepth,
     this.playlistItemId,
   });
 
   final String id;
   final String name;
   final String type;
+  final String? sortName;
+  final String? albumArtist;
+  final List<String> genreNames;
   final String? album;
   final String? albumId;
   final String? albumImageTag;
@@ -178,6 +202,8 @@ class JellyfinItem {
   final DateTime? lastPlayedDate;
   final Duration playbackPosition;
   final String? container;
+  final String? mediaSourceId;
+  final int? audioBitDepth;
   final String? playlistItemId;
 
   bool get isAudio => type == 'Audio';
@@ -209,6 +235,9 @@ class JellyfinItem {
     id: id,
     name: name ?? this.name,
     type: type,
+    sortName: sortName,
+    albumArtist: albumArtist,
+    genreNames: genreNames,
     album: album,
     albumId: albumId,
     albumImageTag: albumImageTag,
@@ -225,6 +254,8 @@ class JellyfinItem {
     lastPlayedDate: lastPlayedDate,
     playbackPosition: playbackPosition,
     container: container,
+    mediaSourceId: mediaSourceId,
+    audioBitDepth: audioBitDepth,
     playlistItemId: playlistItemId,
   );
 
@@ -232,6 +263,9 @@ class JellyfinItem {
     'Id': id,
     'Name': name,
     'Type': type,
+    'SortName': sortName,
+    'AlbumArtist': albumArtist,
+    'Genres': genreNames,
     'Album': album,
     'AlbumId': albumId,
     'AlbumPrimaryImageTag': albumImageTag,
@@ -248,6 +282,8 @@ class JellyfinItem {
     'Overview': overview,
     'DateCreated': dateCreated?.toUtc().toIso8601String(),
     'Container': container,
+    'MediaSourceId': mediaSourceId,
+    'AudioBitDepth': audioBitDepth,
     'PlaylistItemId': playlistItemId,
     'UserData': {
       'IsFavorite': isFavorite,
@@ -275,11 +311,23 @@ class JellyfinItem {
         .whereType<Map>()
         .map((value) => value.cast<String, dynamic>())
         .toList();
+    final audioStream =
+        ((json['MediaStreams'] ?? mediaSources.firstOrNull?['MediaStreams'])
+                    as List? ??
+                const [])
+            .whereType<Map>()
+            .where((stream) => stream['Type'] == 'Audio')
+            .firstOrNull;
     final ticks = (json['RunTimeTicks'] as num?)?.toInt() ?? 0;
     return JellyfinItem(
       id: json['Id'] as String? ?? '',
       name: json['Name'] as String? ?? 'Untitled',
       type: json['Type'] as String? ?? 'Unknown',
+      sortName: json['SortName'] as String?,
+      albumArtist: json['AlbumArtist'] as String?,
+      genreNames: (json['Genres'] as List? ?? const [])
+          .whereType<String>()
+          .toList(),
       album: json['Album'] as String?,
       albumId: json['AlbumId'] as String?,
       albumImageTag: json['AlbumPrimaryImageTag'] as String?,
@@ -303,6 +351,12 @@ class JellyfinItem {
         microseconds:
             ((userData?['PlaybackPositionTicks'] as num?)?.toInt() ?? 0) ~/ 10,
       ),
+      audioBitDepth:
+          ((json['AudioBitDepth'] ?? audioStream?['BitDepth']) as num?)
+              ?.toInt(),
+      mediaSourceId:
+          json['MediaSourceId'] as String? ??
+          mediaSources.firstOrNull?['Id'] as String?,
       container:
           json['Container'] as String? ??
           (mediaSources.isEmpty
@@ -336,13 +390,17 @@ String safeAudioExtension(String? value) {
   };
 }
 
-bool canPlayOriginalOffline(String? container) => const {
-  'mp3',
-  'm4a',
-  'aac',
-  'flac',
-  'wav',
-}.contains(safeAudioExtension(container));
+bool canPlayOriginalOffline(String? container, {int? audioBitDepth}) =>
+    !(Platform.isIOS &&
+        safeAudioExtension(container) == 'flac' &&
+        (audioBitDepth ?? 0) > 24) &&
+    const {
+      'mp3',
+      'm4a',
+      'aac',
+      'flac',
+      'wav',
+    }.contains(safeAudioExtension(container));
 
 List<JellyfinItem> pendingAudioDownloads(
   Iterable<JellyfinItem> items,
@@ -353,6 +411,57 @@ List<JellyfinItem> pendingAudioDownloads(
     for (final item in items)
       if (item.isAudio && item.id.isNotEmpty && seen.add(item.id)) item,
   ];
+}
+
+void sortJellyfinItems(
+  List<JellyfinItem> items,
+  String sortBy, {
+  bool descending = false,
+}) {
+  final keys = sortBy.split(',');
+  int text(String? a, String? b) =>
+      (a ?? '').toLowerCase().compareTo((b ?? '').toLowerCase());
+  items.sort((a, b) {
+    for (final key in keys) {
+      final comparison = switch (key) {
+        'DateCreated' => (a.dateCreated ?? DateTime(1970)).compareTo(
+          b.dateCreated ?? DateTime(1970),
+        ),
+        'DatePlayed' => (a.lastPlayedDate ?? DateTime(1970)).compareTo(
+          b.lastPlayedDate ?? DateTime(1970),
+        ),
+        'ProductionYear' => (a.productionYear ?? 0).compareTo(
+          b.productionYear ?? 0,
+        ),
+        'ParentIndexNumber' => (a.parentIndexNumber ?? 0).compareTo(
+          b.parentIndexNumber ?? 0,
+        ),
+        'IndexNumber' => (a.indexNumber ?? 0).compareTo(b.indexNumber ?? 0),
+        'AlbumArtist' => text(
+          a.albumArtist ?? a.artists.firstOrNull,
+          b.albumArtist ?? b.artists.firstOrNull,
+        ),
+        'Album' => text(a.album, b.album),
+        _ => text(a.sortName ?? a.name, b.sortName ?? b.name),
+      };
+      if (comparison != 0) return descending ? -comparison : comparison;
+    }
+    return a.id.compareTo(b.id);
+  });
+}
+
+List<JellyfinItem> searchLocalMusic(Iterable<JellyfinItem> items, String term) {
+  final words = term.trim().toLowerCase().split(RegExp(r'\s+'));
+  if (term.trim().isEmpty) return [];
+  return {
+    for (final item in items)
+      if (words.every(
+        ('${item.name} ${item.subtitle} ${item.genreNames.join(' ')}')
+            .toLowerCase()
+            .contains,
+      ))
+        item.id: item,
+  }.values.toList();
 }
 
 class JellyfinSessionStore {
@@ -369,6 +478,8 @@ class JellyfinSessionStore {
   final FlutterSecureStorage _storage;
   final Directory? supportDirectory;
   Future<void> _playbackWrite = Future.value();
+  Future<void> _dataWrite = Future.value();
+  Future<void> _downloadWrite = Future.value();
 
   Future<JellyfinSession?> load() async {
     final value = await _storage.read(key: _sessionKey, iOptions: _iosOptions);
@@ -427,12 +538,14 @@ class JellyfinSessionStore {
       iOptions: _iosOptions,
     );
     if (active != null && active.deviceId != session.deviceId) {
+      await _playbackWrite;
       final playback = await _playbackFile();
       if (await playback.exists()) await playback.delete();
     }
   }
 
   Future<void> remove(JellyfinSession session) async {
+    await clearAccountData(session);
     final servers = await loadAll();
     servers.removeWhere((saved) => saved.deviceId == session.deviceId);
     await _storage.write(
@@ -446,6 +559,7 @@ class JellyfinSessionStore {
   Future<void> deactivate({bool clearPlayback = true}) async {
     await _storage.delete(key: _sessionKey, iOptions: _iosOptions);
     if (!clearPlayback) return;
+    await _playbackWrite;
     // ponytail: one queue belongs to the active server; clear it on switches.
     final playback = await _playbackFile();
     if (await playback.exists()) await playback.delete();
@@ -467,6 +581,8 @@ class JellyfinSessionStore {
     _playbackWrite = write.then<void>((_) {}, onError: (_, _) {});
     return write;
   }
+
+  Future<void> flushPlayback() => _playbackWrite;
 
   Future<void> _writePlayback(Map<String, dynamic> state) async {
     final file = await _playbackFile();
@@ -583,62 +699,297 @@ class JellyfinSessionStore {
   Future<void> downloadTrack(
     JellyfinSession session,
     JellyfinClient client,
-    JellyfinItem item,
-  ) async {
-    if (!item.isAudio) {
-      throw const JellyfinException('Only songs can be downloaded.');
-    }
-    final detailed = item.container == null ? await client.item(item.id) : item;
-    final directory = await _downloadDirectory(session);
-    await directory.create(recursive: true);
-    final id = base64UrlEncode(utf8.encode(item.id)).replaceAll('=', '');
-    final partial = File('${directory.path}/$id.part');
-    if (await partial.exists()) await partial.delete();
-    File? completed;
-    try {
-      final detected = await client.downloadItem(
-        item.id,
-        partial,
-        sourceContainer: detailed.container,
-      );
-      final detectedExtension = safeAudioExtension(detected);
-      final extension = detectedExtension == 'audio'
-          ? safeAudioExtension(detailed.container)
-          : detectedExtension;
-      completed = File('${directory.path}/$id.$extension');
-      if (await completed.exists()) await completed.delete();
-      await partial.rename(completed.path);
-      final records = await _downloadRecords(session);
-      records
-        ..removeWhere((record) => (record['item'] as Map?)?['Id'] == item.id)
-        ..add({
-          'item': detailed.toJson(),
-          'file': completed.uri.pathSegments.last,
-        });
-      await _saveDownloadRecords(session, records);
-    } on Object {
-      if (await partial.exists()) await partial.delete();
-      if (completed != null && await completed.exists()) {
-        await completed.delete();
+    JellyfinItem item, {
+    void Function(int received, int? total)? onProgress,
+    int? maxBytes,
+  }) {
+    final operation = _downloadWrite.then((_) async {
+      if (!item.isAudio || item.id.isEmpty) {
+        throw const JellyfinException('Only songs can be downloaded.');
       }
-      rethrow;
+      if ((await downloadedUris(session, [item.id])).containsKey(item.id)) {
+        return;
+      }
+      final detailed = item.container == null
+          ? await client.item(item.id)
+          : item;
+      final directory = await _downloadDirectory(session);
+      await directory.create(recursive: true);
+      final id = _fileId(item.id);
+      final partial = File('${directory.path}/$id.part');
+      File? completed;
+      try {
+        final detected = await client.downloadItem(
+          item.id,
+          partial,
+          sourceContainer: detailed.container,
+          audioBitDepth: detailed.audioBitDepth,
+          onProgress: onProgress,
+          maxBytes: maxBytes,
+        );
+        final extension = safeAudioExtension(detected);
+        completed = File('${directory.path}/$id.$extension');
+        await partial.rename(completed.path);
+        final records = await _downloadRecords(session);
+        records
+          ..removeWhere((record) => (record['item'] as Map?)?['Id'] == item.id)
+          ..add({
+            'item': detailed.toJson(),
+            'file': completed.uri.pathSegments.last,
+          });
+        await _saveDownloadRecords(session, records);
+      } on Object {
+        if (await partial.exists()) await partial.delete();
+        if (completed != null && await completed.exists()) {
+          await completed.delete();
+        }
+        rethrow;
+      }
+      // Artwork is optional; an unavailable image must not discard valid audio.
+      final artworkId = detailed.artworkId;
+      if (artworkId != null) {
+        try {
+          final file = File('${directory.path}/${_fileId(artworkId)}.art');
+          if (!await file.exists()) {
+            final temporary = File('${file.path}.part');
+            try {
+              await client.downloadArtwork(artworkId, temporary);
+              await temporary.rename(file.path);
+            } finally {
+              if (await temporary.exists()) await temporary.delete();
+            }
+          }
+        } on Object {
+          /* Audio remains available when artwork cannot be cached. */
+        }
+      }
+    });
+    _downloadWrite = operation.then<void>((_) {}, onError: (_, _) {});
+    return operation;
+  }
+
+  Future<void> removeDownload(JellyfinSession session, String itemId) {
+    final operation = _downloadWrite.then((_) async {
+      final directory = await _downloadDirectory(session);
+      final records = await _downloadRecords(session);
+      final names = records
+          .where((record) => (record['item'] as Map?)?['Id'] == itemId)
+          .map((record) => record['file'])
+          .whereType<String>()
+          .toList();
+      records.removeWhere(
+        (record) => (record['item'] as Map?)?['Id'] == itemId,
+      );
+      await _saveDownloadRecords(session, records);
+      for (final name in names.where(_safeDownloadName)) {
+        final file = File('${directory.path}/$name');
+        if (await file.exists()) await file.delete();
+      }
+    });
+    _downloadWrite = operation.then<void>((_) {}, onError: (_, _) {});
+    return operation;
+  }
+
+  Future<void> clearAccountData(JellyfinSession session) async {
+    await _downloadWrite;
+    await _dataWrite;
+    final directory = await _downloadDirectory(session);
+    if (await directory.exists()) await directory.delete(recursive: true);
+    final cache = await _libraryCacheFile(session);
+    if (await cache.exists()) await cache.delete();
+    final value = await _storage.read(
+      key: _preferencesKey,
+      iOptions: _iosOptions,
+    );
+    if (value != null) {
+      final all = (jsonDecode(value) as Map).cast<String, dynamic>()
+        ..remove(_preferenceId(session));
+      await _storage.write(
+        key: _preferencesKey,
+        value: jsonEncode(all),
+        iOptions: _iosOptions,
+      );
     }
   }
 
-  Future<void> removeDownload(JellyfinSession session, String itemId) async {
+  Future<void> clearDownloads(JellyfinSession session) async {
+    await _downloadWrite;
+    await _dataWrite;
     final directory = await _downloadDirectory(session);
-    final records = await _downloadRecords(session);
-    final removed = records.where(
-      (record) => (record['item'] as Map?)?['Id'] == itemId,
-    );
-    for (final record in removed) {
-      final name = record['file'];
-      if (name is! String || !_safeDownloadName(name)) continue;
-      final file = File('${directory.path}/$name');
-      if (await file.exists()) await file.delete();
+    if (await directory.exists()) await directory.delete(recursive: true);
+  }
+
+  String _fileId(String value) =>
+      base64UrlEncode(utf8.encode(value)).replaceAll('=', '');
+
+  Future<Map<String, Uri>> downloadedArtwork(JellyfinSession session) async {
+    final directory = await _downloadDirectory(session);
+    if (!await directory.exists()) return {};
+    final result = <String, Uri>{};
+    await for (final file in directory.list()) {
+      if (file is! File || !file.path.endsWith('.art')) continue;
+      try {
+        final name = file.uri.pathSegments.last;
+        final id = utf8.decode(
+          base64Url.decode(
+            base64Url.normalize(name.substring(0, name.length - 4)),
+          ),
+        );
+        result[id] = file.uri;
+      } on FormatException {
+        continue;
+      }
     }
-    records.removeWhere((record) => (record['item'] as Map?)?['Id'] == itemId);
-    await _saveDownloadRecords(session, records);
+    return result;
+  }
+
+  Future<Map<String, dynamic>> loadDownloadJobs(
+    JellyfinSession session,
+  ) async =>
+      await _readJson(
+        File('${(await _downloadDirectory(session)).path}/jobs.json'),
+      ) ??
+      {};
+
+  Future<void> saveDownloadJobs(
+    JellyfinSession session,
+    Map<String, dynamic> jobs,
+  ) async => _writeJson(
+    File('${(await _downloadDirectory(session)).path}/jobs.json'),
+    jobs,
+  );
+
+  Future<Map<String, dynamic>?> _readJson(File file) async {
+    try {
+      if (!await file.exists()) return null;
+      return (jsonDecode(await file.readAsString()) as Map)
+          .cast<String, dynamic>();
+    } on FormatException {
+      return null;
+    }
+  }
+
+  Future<void> _writeJson(File file, Map<String, dynamic> value) {
+    final encoded = jsonEncode(value);
+    final operation = _dataWrite.then((_) async {
+      await file.parent.create(recursive: true);
+      final temporary = File('${file.path}.tmp');
+      await temporary.writeAsString(encoded, flush: true);
+      await temporary.rename(file.path);
+    });
+    _dataWrite = operation.then<void>((_) {}, onError: (_, _) {});
+    return operation;
+  }
+
+  Future<List<JellyfinItem>> offlineCatalog(JellyfinSession session) async {
+    final tracks = (await loadDownloads(session)).items;
+    final catalog = {for (final track in tracks) track.id: track};
+    for (final track in tracks) {
+      if (track.albumId case final id?) {
+        catalog.putIfAbsent(
+          id,
+          () => JellyfinItem(
+            id: id,
+            name: track.album ?? 'Album',
+            type: 'MusicAlbum',
+            imageTag: track.albumImageTag,
+            artists: track.artists,
+          ),
+        );
+      }
+      for (var i = 0; i < track.artistIds.length; i++) {
+        final id = track.artistIds[i];
+        catalog.putIfAbsent(
+          id,
+          () => JellyfinItem(
+            id: id,
+            name: i < track.artists.length ? track.artists[i] : 'Artist',
+            type: 'MusicArtist',
+          ),
+        );
+      }
+    }
+    final directory = await _downloadDirectory(session);
+    if (await directory.exists()) {
+      await for (final file in directory.list()) {
+        if (file is! File || !file.path.endsWith('.collection.json')) continue;
+        final saved = await _readJson(file);
+        final children = (saved?['children'] as List? ?? const [])
+            .whereType<Map>();
+        if (!children.any((child) => catalog[child['Id']]?.isAudio == true)) {
+          continue;
+        }
+        if (saved?['item'] case final Map item) {
+          final parsed = JellyfinItem.fromJson(item.cast<String, dynamic>());
+          catalog[parsed.id] = parsed;
+        }
+      }
+    }
+    return catalog.values.toList();
+  }
+
+  Future<List<JellyfinItem>> collectionItems(
+    JellyfinClient api,
+    JellyfinItem item, {
+    bool offlineOnly = false,
+  }) async {
+    final file = File(
+      '${(await _downloadDirectory(api.session)).path}/${_fileId(item.id)}.collection.json',
+    );
+    if (!offlineOnly) {
+      try {
+        final children = item.isArtist
+            ? [
+                ...await api.songsForArtist(item.id),
+                ...await api.albumsForArtist(item.id),
+              ]
+            : item.isGenre
+            ? await api.songsForGenre(item.id)
+            : item.isPlaylist
+            ? await api.playlistItems(item.id)
+            : await api.children(item.id);
+        try {
+          await _writeJson(file, {
+            'item': item.toJson(),
+            'children': children.map((child) => child.toJson()).toList(),
+          });
+        } on FileSystemException {
+          /* Keep live browsing available on a full disk. */
+        }
+        return children;
+      } on JellyfinException catch (error) {
+        if (error.isAuthenticationError) rethrow;
+        final local = await collectionItems(api, item, offlineOnly: true);
+        if (local.isEmpty) rethrow;
+        return local;
+      }
+    }
+    final tracks = (await loadDownloads(api.session)).items;
+    final ids = tracks.map((track) => track.id).toSet();
+    final saved = await _readJson(file);
+    if (saved != null) {
+      return (saved['children'] as List? ?? const [])
+          .whereType<Map>()
+          .map((child) => JellyfinItem.fromJson(child.cast<String, dynamic>()))
+          .where((child) => child.isAudio && ids.contains(child.id))
+          .toList();
+    }
+    final matches = tracks
+        .where(
+          (track) => item.isAlbum
+              ? track.albumId == item.id
+              : item.isArtist
+              ? track.artistIds.contains(item.id)
+              : item.isGenre
+              ? track.genreNames.contains(item.name)
+              : false,
+        )
+        .toList();
+    sortJellyfinItems(
+      matches,
+      'AlbumArtist,Album,ParentIndexNumber,IndexNumber,SortName',
+    );
+    return matches;
   }
 
   Future<List<Map<String, dynamic>>> _downloadRecords(
@@ -662,14 +1013,7 @@ class JellyfinSessionStore {
     JellyfinSession session,
     List<Map<String, dynamic>> records,
   ) async {
-    final file = await _downloadManifest(session);
-    await file.parent.create(recursive: true);
-    final temporary = File('${file.path}.tmp');
-    await temporary.writeAsString(
-      jsonEncode({'downloads': records}),
-      flush: true,
-    );
-    await temporary.rename(file.path);
+    await _writeJson(await _downloadManifest(session), {'downloads': records});
   }
 
   bool _safeDownloadName(String value) =>
@@ -858,18 +1202,51 @@ class JellyfinClient {
     {'maxWidth': '$width', 'quality': '88'},
   );
 
-  Uri streamUri(String itemId) => uri('/Audio/$itemId/universal', {
-    'UserId': session.userId,
-    'DeviceId': session.deviceId,
-    'MaxStreamingBitrate': '${preferences.streamingQuality.maxBitrate}',
-    'Container': 'opus,mp3,aac,m4a,flac,webma,webm,wav,ogg',
-    'TranscodingContainer': 'ts',
-    'TranscodingProtocol': 'hls',
-    'AudioCodec': 'aac',
-    'PlaySessionId': _playSessionId(itemId),
-    'EnableRedirection': 'true',
-    'EnableRemoteMedia': 'false',
-  });
+  Uri streamUri(
+    String itemId, {
+    String? sourceContainer,
+    String? mediaSourceId,
+    int? audioBitDepth,
+  }) {
+    final directContainers = Platform.isIOS
+        ? const {'mp3', 'aac', 'm4a', 'flac', 'wav'}
+        : const {
+            'opus',
+            'mp3',
+            'aac',
+            'm4a',
+            'flac',
+            'webma',
+            'webm',
+            'wav',
+            'ogg',
+          };
+    final container = sourceContainer?.toLowerCase();
+    final direct =
+        preferences.streamingQuality == StreamingQuality.original &&
+        directContainers.contains(container) &&
+        !(Platform.isIOS && container == 'flac' && (audioBitDepth ?? 0) > 24);
+    // Explicit extensions let native players select the correct demuxer, and
+    // HLS retains seeking for transcoded audio. Unknown formats use AAC fallback.
+    return uri(
+      '/Audio/$itemId/${direct ? 'stream.$container' : 'master.m3u8'}',
+      {
+        'UserId': session.userId,
+        'DeviceId': session.deviceId,
+        'MediaSourceId': mediaSourceId ?? itemId,
+        'MaxStreamingBitrate': '${preferences.streamingQuality.maxBitrate}',
+        if (direct) 'Static': 'true',
+        if (!direct)
+          'AudioBitRate':
+              '${min(preferences.streamingQuality.maxBitrate, 320000)}',
+        if (!direct) 'AudioCodec': 'aac',
+        if (!direct) 'SegmentContainer': 'ts',
+        if (!direct) 'EnableAutoStreamCopy': 'false',
+        'PlaySessionId': _playSessionId(itemId),
+        'EnableRemoteMedia': 'false',
+      },
+    );
+  }
 
   Map<String, String> get authorizationHeaders => {
     HttpHeaders.authorizationHeader: _authorizationValue(authenticated: true),
@@ -879,8 +1256,14 @@ class JellyfinClient {
     String itemId,
     File destination, {
     String? sourceContainer,
+    int? audioBitDepth,
+    void Function(int received, int? total)? onProgress,
+    int? maxBytes,
   }) async {
-    final portable = canPlayOriginalOffline(sourceContainer);
+    final portable = canPlayOriginalOffline(
+      sourceContainer,
+      audioBitDepth: audioBitDepth,
+    );
     try {
       final request = await _http
           .getUrl(
@@ -911,19 +1294,72 @@ class JellyfinClient {
           statusCode: response.statusCode,
         );
       }
-      await response.pipe(destination.openWrite());
-      return portable ? response.headers.contentType?.subType : 'm4a';
+      final expected = response.contentLength;
+      if (maxBytes != null && expected > maxBytes) {
+        throw const JellyfinException('Download storage limit reached.');
+      }
+      var received = 0;
+      final output = destination.openWrite();
+      try {
+        await output.addStream(
+          response.timeout(const Duration(seconds: 30)).map((chunk) {
+            received += chunk.length;
+            if (maxBytes != null && received > maxBytes) {
+              throw const JellyfinException('Download storage limit reached.');
+            }
+            onProgress?.call(received, expected < 0 ? null : expected);
+            return chunk;
+          }),
+        );
+        await output.flush();
+      } finally {
+        await output.close();
+      }
+      if (received == 0 || (expected >= 0 && received != expected)) {
+        throw const JellyfinException(
+          'The download was incomplete. Retry this song.',
+        );
+      }
+      return portable ? safeAudioExtension(sourceContainer) : 'm4a';
     } on TimeoutException {
       throw const JellyfinException('The download took too long to start.');
     } on SocketException {
       throw const JellyfinException(
         'The download stopped because the server connection was lost.',
       );
+    } on HttpException {
+      throw const JellyfinException(
+        'The connection to Jellyfin was interrupted. Retry when connected.',
+      );
     } on HandshakeException {
       throw const JellyfinException(
         'The server certificate could not be verified.',
       );
     }
+  }
+
+  Future<void> downloadArtwork(String itemId, File destination) async {
+    final request = await _http
+        .getUrl(imageUri(itemId))
+        .timeout(const Duration(seconds: 12));
+    authorizationHeaders.forEach(request.headers.set);
+    final response = await request.close().timeout(const Duration(seconds: 15));
+    if (response.statusCode != 200 ||
+        response.headers.contentType?.primaryType != 'image') {
+      await response.drain<void>();
+      throw const JellyfinException('Artwork unavailable.');
+    }
+    var bytes = 0;
+    await response
+        .timeout(const Duration(seconds: 15))
+        .map((chunk) {
+          bytes += chunk.length;
+          if (bytes > 10 * 1024 * 1024) {
+            throw const JellyfinException('Artwork too large.');
+          }
+          return chunk;
+        })
+        .pipe(destination.openWrite());
   }
 
   Future<List<JellyfinLibrary>> musicLibraries() async {
@@ -975,12 +1411,11 @@ class JellyfinClient {
     'SortOrder': 'Ascending',
   }, limit: limit);
 
-  Future<List<JellyfinItem>> artists({int? limit}) => _collectionItems({
-    'IncludeItemTypes': 'MusicArtist',
-    'Recursive': 'true',
-    'SortBy': 'SortName',
-    'SortOrder': 'Ascending',
-  }, limit: limit);
+  Future<List<JellyfinItem>> artists({int? limit}) => _collectionItems(
+    {'Recursive': 'true', 'SortBy': 'SortName', 'SortOrder': 'Ascending'},
+    limit: limit,
+    path: '/Artists',
+  );
 
   Future<List<JellyfinItem>> songs({int? limit}) => _collectionItems({
     'IncludeItemTypes': 'Audio',
@@ -1244,7 +1679,6 @@ class JellyfinClient {
         'ItemId': itemId,
         'PositionTicks': position.inMicroseconds * 10,
         'IsPaused': paused,
-        'PlayMethod': 'Transcode',
         'PlaySessionId': _playSessionId(itemId),
       },
     );
@@ -1282,6 +1716,7 @@ class JellyfinClient {
       pages.expand((page) => page.items),
       query: query,
       limit: limit,
+      sortMerged: pages.length > 1,
     );
   }
 
@@ -1298,7 +1733,11 @@ class JellyfinClient {
     )) {
       results.addAll(batch);
     }
-    return _merge(results, query: query);
+    return _merge(
+      results,
+      query: query,
+      sortMerged: scopeToLibraries && preferences.musicLibraryIds.length > 1,
+    );
   }
 
   Stream<List<JellyfinItem>> _itemBatches(
@@ -1359,33 +1798,19 @@ class JellyfinClient {
     Iterable<JellyfinItem> values, {
     Map<String, String> query = const {},
     int? limit,
+    bool sortMerged = false,
   }) {
-    final sort = query['SortBy']?.split(',').first;
-    final result = sort == null
-        ? values.toList()
-        : <String, JellyfinItem>{
-            for (final item in values) item.id: item,
-          }.values.toList();
-    if (sort == null) {
-      return limit == null ? result : result.take(limit).toList();
+    final sorted = query.containsKey('SortBy');
+    final result = sorted
+        ? {for (final item in values) item.id: item}.values.toList()
+        : values.toList(); // Playlist entries may intentionally repeat a song.
+    if (sortMerged && sorted && query['SortBy'] != 'Random') {
+      sortJellyfinItems(
+        result,
+        query['SortBy']!,
+        descending: query['SortOrder'] == 'Descending',
+      );
     }
-    int compare(JellyfinItem a, JellyfinItem b) => switch (sort) {
-      'DateCreated' =>
-        (a.dateCreated ?? DateTime.fromMillisecondsSinceEpoch(0)).compareTo(
-          b.dateCreated ?? DateTime.fromMillisecondsSinceEpoch(0),
-        ),
-      'DatePlayed' =>
-        (a.lastPlayedDate ?? DateTime.fromMillisecondsSinceEpoch(0)).compareTo(
-          b.lastPlayedDate ?? DateTime.fromMillisecondsSinceEpoch(0),
-        ),
-      'ProductionYear' => (a.productionYear ?? 0).compareTo(
-        b.productionYear ?? 0,
-      ),
-      _ => a.name.toLowerCase().compareTo(b.name.toLowerCase()),
-    };
-    result.sort(
-      query['SortOrder'] == 'Descending' ? (a, b) => -compare(a, b) : compare,
-    );
     return limit == null ? result : result.take(limit).toList();
   }
 
@@ -1448,10 +1873,16 @@ class JellyfinClient {
       final response = await request.close().timeout(
         const Duration(seconds: 30),
       );
-      final text = await utf8.decoder.bind(response).join();
+      final text = await utf8.decoder
+          .bind(response)
+          .join()
+          .timeout(const Duration(seconds: 30));
       if (response.statusCode < 200 || response.statusCode >= 300) {
         final message = switch (response.statusCode) {
-          401 || 403 => 'Your Jellyfin session expired. Sign in again.',
+          401 || 403 =>
+            authenticated
+                ? 'Your Jellyfin session expired. Sign in again.'
+                : 'Incorrect username or password.',
           404 => 'The requested music is no longer available.',
           _ =>
             'Jellyfin returned ${response.statusCode}${text.isEmpty ? '.' : ': $text'}',
@@ -1467,6 +1898,10 @@ class JellyfinClient {
     } on SocketException {
       throw const JellyfinException(
         'Cannot reach the Jellyfin server. Check its address and your network.',
+      );
+    } on HttpException {
+      throw const JellyfinException(
+        'The connection to Jellyfin was interrupted. Retry when connected.',
       );
     } on HandshakeException {
       throw const JellyfinException(
@@ -1492,7 +1927,7 @@ class JellyfinClient {
   }
 
   static const _itemFields =
-      'Overview,Genres,DateCreated,MediaSources,ParentId,PrimaryImageAspectRatio';
+      'Overview,Genres,SortName,AlbumArtist,DateCreated,MediaSources,ParentId,PrimaryImageAspectRatio';
 }
 
 class AppController extends ChangeNotifier {
@@ -1518,6 +1953,15 @@ class AppController extends ChangeNotifier {
   List<JellyfinItem> favorites = const [];
   List<JellyfinItem> genres = const [];
   List<JellyfinItem> downloads = const [];
+  List<JellyfinItem> downloadedCatalog = const [];
+  Map<String, Uri> artworkUris = const {};
+  List<JellyfinItem> failedDownloads = const [];
+  bool downloadsPaused = false;
+  int downloadReceivedBytes = 0;
+  int? downloadTotalBytes;
+  JellyfinClient? _downloadClient;
+  final Set<String> _cancelledDownloads = {};
+  bool _disposed = false;
   int downloadedBytes = 0;
   List<JellyfinItem> downloadQueue = const [];
   JellyfinItem? downloadingItem;
@@ -1608,6 +2052,26 @@ class AppController extends ChangeNotifier {
     client = next;
     downloads = offline.items;
     downloadedBytes = offline.bytes;
+    downloadedCatalog = await store.offlineCatalog(value);
+    artworkUris = await store.downloadedArtwork(value);
+    final jobs = await store.loadDownloadJobs(value);
+    List<JellyfinItem> jobItems(String key) => (jobs[key] as List? ?? const [])
+        .whereType<Map>()
+        .map((item) => JellyfinItem.fromJson(item.cast<String, dynamic>()))
+        .toList();
+    downloadQueue = pendingAudioDownloads(
+      jobItems('pending'),
+      downloads.map((item) => item.id),
+    );
+    failedDownloads = pendingAudioDownloads(
+      jobItems('failed'),
+      downloads.map((item) => item.id),
+    );
+    downloadsPaused = jobs['paused'] == true;
+    if (failedDownloads.isNotEmpty) {
+      downloadError = 'Some downloads need retrying.';
+    }
+    if (!identical(client, next)) return;
     try {
       await _restoreLibraryCache(value);
     } on Object {
@@ -1615,6 +2079,7 @@ class AppController extends ChangeNotifier {
     }
     if (!identical(client, next)) return;
     notifyListeners();
+    _startDownloads();
     await refresh();
   }
 
@@ -1640,27 +2105,47 @@ class AppController extends ChangeNotifier {
         }
         if (!identical(client, api)) return;
       }
-      final results = await Future.wait([
-        api.recentlyAdded(),
-        api.recentlyPlayed(),
-        api.albums(),
-        api.artists(),
-        api.songs(),
-        api.playlists(),
-        api.favorites(),
-        api.genres(),
+      musicLibraries = availableLibraries;
+      Future<void> publish(
+        Future<List<JellyfinItem>> request,
+        void Function(List<JellyfinItem>) assign,
+      ) async {
+        final result = await request;
+        if (!identical(client, api)) return;
+        assign(result);
+        notifyListeners();
+      }
+
+      Future<void> loadSongs() async {
+        final seen = <String, JellyfinItem>{};
+        await for (final batch in api.songBatches()) {
+          if (!identical(client, api)) return;
+          for (final item in batch) {
+            seen[item.id] = item;
+          }
+          songs = seen.values.toList();
+          notifyListeners();
+        }
+        if (identical(client, api)) {
+          songs = seen.values.toList();
+          sortJellyfinItems(songs, 'SortName');
+        }
+      }
+
+      await Future.wait([
+        publish(api.recentlyAdded(), (items) => recentlyAdded = items),
+        publish(api.recentlyPlayed(), (items) => recentlyPlayed = items),
+        publish(api.albums(), (items) {
+          albums = items;
+          randomAlbums = [...items]..shuffle(Random());
+        }),
+        publish(api.artists(), (items) => artists = items),
+        loadSongs(),
+        publish(api.playlists(), (items) => playlists = items),
+        publish(api.favorites(), (items) => favorites = items),
+        publish(api.genres(), (items) => genres = items),
       ]);
       if (!identical(client, api)) return;
-      recentlyAdded = results[0];
-      recentlyPlayed = results[1];
-      albums = results[2];
-      artists = results[3];
-      songs = results[4];
-      playlists = results[5];
-      favorites = results[6];
-      genres = results[7];
-      musicLibraries = availableLibraries;
-      randomAlbums = [...albums]..shuffle(Random());
       status = AppStatus.ready;
       errorMessage = null;
       if (session case final active?) {
@@ -1701,22 +2186,27 @@ class AppController extends ChangeNotifier {
   Future<List<JellyfinItem>> search(String term) async {
     final api = client;
     if (api == null) return const [];
-    return api.search(term);
+    if (status == AppStatus.error) {
+      return searchLocalMusic(downloadedCatalog, term);
+    }
+    try {
+      return await api.search(term);
+    } on JellyfinException catch (error) {
+      if (error.isAuthenticationError) rethrow;
+      final local = searchLocalMusic(downloadedCatalog, term);
+      if (local.isEmpty) rethrow;
+      return local;
+    }
   }
 
   Future<List<JellyfinItem>> children(JellyfinItem item) async {
     final api = client;
     if (api == null) return const [];
-    if (item.isArtist) {
-      final results = await Future.wait([
-        api.songsForArtist(item.id),
-        api.albumsForArtist(item.id),
-      ]);
-      return [...results[0].take(10), ...results[1]];
-    }
-    if (item.isGenre) return api.songsForGenre(item.id);
-    if (item.isPlaylist) return api.playlistItems(item.id);
-    return api.children(item.id);
+    return store.collectionItems(
+      api,
+      item,
+      offlineOnly: status == AppStatus.error,
+    );
   }
 
   bool isDownloaded(String itemId) =>
@@ -1725,57 +2215,142 @@ class AppController extends ChangeNotifier {
   Future<int> enqueueDownload(JellyfinItem item) async {
     final api = client;
     if (api == null) throw const JellyfinException('Sign in first.');
-    final items = item.isAudio
-        ? [item]
-        : item.isArtist
-        ? await api.songsForArtist(item.id)
-        : item.isPlaylist
-        ? await api.playlistItems(item.id)
-        : item.isAlbum
-        ? await api.children(item.id)
-        : throw const JellyfinException('This item cannot be downloaded.');
+    final items = item.isAudio ? [item] : await children(item);
     return enqueueDownloads(items);
   }
 
-  int enqueueDownloads(Iterable<JellyfinItem> values) {
-    final active = session;
-    final api = client;
-    if (active == null || api == null) return 0;
+  Future<int> enqueueDownloads(Iterable<JellyfinItem> values) async {
+    if (session == null || client == null) return 0;
     final items = pendingAudioDownloads(values, [
       ...downloads.map((item) => item.id),
       ...downloadQueue.map((item) => item.id),
-      ?downloadingId,
     ]);
     if (items.isEmpty) return 0;
-    downloadError = null;
+    final ids = items.map((item) => item.id).toSet();
+    failedDownloads = failedDownloads
+        .where((item) => !ids.contains(item.id))
+        .toList();
     downloadQueue = [...downloadQueue, ...items];
+    downloadError = null;
+    await _saveDownloadJobs();
     notifyListeners();
-    _downloadWorker ??= _processDownloadQueue(active, api, _downloadGeneration);
+    _startDownloads();
     return items.length;
+  }
+
+  Future<void> _saveDownloadJobs() async {
+    final active = session;
+    if (active == null) return;
+    await store.saveDownloadJobs(active, {
+      'pending': downloadQueue.map((item) => item.toJson()).toList(),
+      'failed': failedDownloads.map((item) => item.toJson()).toList(),
+      'paused': downloadsPaused,
+    });
+  }
+
+  void _startDownloads() {
+    final active = session;
+    if (active == null ||
+        _downloadWorker != null ||
+        downloadsPaused ||
+        downloadQueue.isEmpty) {
+      return;
+    }
+    _downloadWorker = _processDownloadQueue(active, _downloadGeneration);
+  }
+
+  Future<void> _reloadDownloads(JellyfinSession active) async {
+    final offline = await store.loadDownloads(active);
+    final catalog = await store.offlineCatalog(active);
+    final artwork = await store.downloadedArtwork(active);
+    if (session?.deviceId != active.deviceId || _disposed) return;
+    downloads = offline.items;
+    downloadedBytes = offline.bytes;
+    downloadedCatalog = catalog;
+    artworkUris = artwork;
   }
 
   Future<void> _processDownloadQueue(
     JellyfinSession active,
-    JellyfinClient api,
     int generation,
   ) async {
     try {
-      while (generation == _downloadGeneration && downloadQueue.isNotEmpty) {
+      while (generation == _downloadGeneration &&
+          !downloadsPaused &&
+          downloadQueue.isNotEmpty) {
         final item = downloadQueue.first;
-        downloadQueue = downloadQueue.sublist(1);
+        final api = JellyfinClient(active, preferences: preferences);
+        _downloadClient = api;
         downloadingItem = item;
+        downloadReceivedBytes = 0;
+        downloadTotalBytes = null;
         notifyListeners();
         try {
-          await store.downloadTrack(active, api, item);
+          if (preferences.wifiOnlyDownloads) {
+            final allowed = await const MethodChannel(
+              'com.thomaskleckner.shrimphony/network',
+            ).invokeMethod<bool>('isWifi');
+            if (allowed != true) {
+              downloadsPaused = true;
+              downloadError =
+                  'Downloads paused. Connect to Wi-Fi, then resume.';
+              break;
+            }
+          }
+          final limit = preferences.downloadLimitBytes;
+          final remaining = limit == 0 ? null : max(0, limit - downloadedBytes);
+          if (remaining == 0) {
+            throw const JellyfinException('Download storage limit reached.');
+          }
+          await store.downloadTrack(
+            active,
+            api,
+            item,
+            maxBytes: remaining,
+            onProgress: (received, total) {
+              if (generation != _downloadGeneration || _disposed) return;
+              // Publish byte progress at roughly 1% intervals, not every network packet.
+              if (received - downloadReceivedBytes <
+                      (total ?? 10240000) ~/ 100 &&
+                  received != total) {
+                return;
+              }
+              downloadReceivedBytes = received;
+              downloadTotalBytes = total;
+              notifyListeners();
+            },
+          );
           if (generation != _downloadGeneration) return;
-          final offline = await store.loadDownloads(active);
-          downloads = offline.items;
-          downloadedBytes = offline.bytes;
+          await _reloadDownloads(active);
+          downloadQueue = downloadQueue
+              .where((value) => value.id != item.id)
+              .toList();
         } on Object catch (error) {
           if (generation != _downloadGeneration) return;
-          downloadError = 'Could not download ${item.name}: $error';
+          if (!_cancelledDownloads.contains(item.id) && !downloadsPaused) {
+            failedDownloads = [
+              ...failedDownloads.where((value) => value.id != item.id),
+              item,
+            ];
+            downloadQueue = downloadQueue
+                .where((value) => value.id != item.id)
+                .toList();
+            downloadError = 'Could not download ${item.name}: $error';
+          }
+        } finally {
+          api.close();
+          if (identical(_downloadClient, api)) _downloadClient = null;
+          _cancelledDownloads.remove(item.id);
         }
+        if (generation != _downloadGeneration) return;
+        await _saveDownloadJobs();
         notifyListeners();
+      }
+      if (generation == _downloadGeneration) await _saveDownloadJobs();
+    } on Object catch (error) {
+      if (generation == _downloadGeneration) {
+        downloadsPaused = true;
+        downloadError = 'Downloads paused: $error';
       }
     } finally {
       if (generation == _downloadGeneration) {
@@ -1786,6 +2361,40 @@ class AppController extends ChangeNotifier {
     }
   }
 
+  Future<void> pauseDownloads() async {
+    downloadsPaused = true;
+    _downloadClient?.close();
+    await _saveDownloadJobs();
+    await _downloadWorker;
+    notifyListeners();
+  }
+
+  Future<void> resumeDownloads() async {
+    await _downloadWorker;
+    downloadsPaused = false;
+    downloadError = null;
+    await _saveDownloadJobs();
+    _startDownloads();
+    notifyListeners();
+  }
+
+  Future<void> retryDownloads() async {
+    final failed = [...failedDownloads];
+    await enqueueDownloads(failed);
+    await resumeDownloads();
+  }
+
+  Future<void> cancelDownload(String id) async {
+    if (downloadingId == id) {
+      _cancelledDownloads.add(id);
+      _downloadClient?.close();
+    }
+    downloadQueue = downloadQueue.where((item) => item.id != id).toList();
+    failedDownloads = failedDownloads.where((item) => item.id != id).toList();
+    await _saveDownloadJobs();
+    notifyListeners();
+  }
+
   void clearDownloadError() {
     downloadError = null;
     notifyListeners();
@@ -1793,19 +2402,32 @@ class AppController extends ChangeNotifier {
 
   void _resetDownloadQueue() {
     _downloadGeneration++;
-    downloadQueue = const [];
+    _downloadClient?.close();
+    _downloadClient = null;
+    downloadQueue = failedDownloads = const [];
     downloadingItem = null;
     downloadError = null;
+    downloadsPaused = false;
     _downloadWorker = null;
+    _cancelledDownloads.clear();
   }
 
   Future<void> removeDownload(JellyfinItem item) async {
     final active = session;
     if (active == null) return;
     await store.removeDownload(active, item.id);
-    final offline = await store.loadDownloads(active);
-    downloads = offline.items;
-    downloadedBytes = offline.bytes;
+    await _reloadDownloads(active);
+    notifyListeners();
+  }
+
+  Future<void> clearDownloads() async {
+    final active = session;
+    if (active == null) return;
+    await pauseDownloads();
+    downloadQueue = failedDownloads = const [];
+    await store.clearDownloads(active);
+    await _reloadDownloads(active);
+    downloadError = null;
     notifyListeners();
   }
 
@@ -2013,6 +2635,7 @@ class AppController extends ChangeNotifier {
 
   Future<void> removeServer(JellyfinSession value) async {
     final removingActive = session?.deviceId == value.deviceId;
+    if (removingActive) await pauseDownloads();
     await store.remove(value);
     if (editingServer?.deviceId == value.deviceId) editingServer = null;
     if (removingActive) {
@@ -2050,7 +2673,8 @@ class AppController extends ChangeNotifier {
     session = null;
     recentlyAdded = recentlyPlayed = randomAlbums = albums = artists = songs =
         playlists = favorites = genres = const [];
-    downloads = const [];
+    downloads = downloadedCatalog = const [];
+    artworkUris = const {};
     downloadedBytes = 0;
     _resetDownloadQueue();
     _refreshingClient = null;
@@ -2060,6 +2684,8 @@ class AppController extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
+    _resetDownloadQueue();
     client?.close();
     super.dispose();
   }

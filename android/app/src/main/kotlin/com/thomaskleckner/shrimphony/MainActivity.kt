@@ -9,6 +9,8 @@ import android.database.Cursor
 import android.media.MediaRouter2
 import android.media.session.MediaSessionManager
 import android.net.Uri
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Binder
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -26,6 +28,23 @@ import java.util.UUID
 class MainActivity : AudioServiceActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger,
+            "com.thomaskleckner.shrimphony/network").setMethodCallHandler { call, result ->
+            if (call.method != "isWifi") { result.notImplemented(); return@setMethodCallHandler }
+            val manager = getSystemService(ConnectivityManager::class.java)
+            val caps = manager.getNetworkCapabilities(manager.activeNetwork)
+            result.success(caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true)
+        }
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger,
+            "com.thomaskleckner.shrimphony/links").setMethodCallHandler { call, result ->
+            val url = call.argument<String>("url")?.let(Uri::parse)
+            if (call.method != "open" || url?.scheme !in setOf("https", "mailto")) {
+                result.error("invalid_url", "Use an HTTPS or email support link", null)
+            } else {
+                try { startActivity(Intent(Intent.ACTION_VIEW, url)); result.success(null) }
+                catch (_: Exception) { result.error("unavailable", "No app can open this link", null) }
+            }
+        }
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             "com.thomaskleckner.shrimphony/audio_output",
@@ -50,9 +69,12 @@ class MainActivity : AudioServiceActivity() {
                 return@setMethodCallHandler
             }
             val serverUrl = call.argument<String>("serverUrl")
-            getSharedPreferences("android_auto", MODE_PRIVATE).edit().apply {
-                if (serverUrl == null) remove("server_url") else putString("server_url", serverUrl)
-            }.apply()
+            val authorization = call.argument<String>("authorization")
+            val session = if (serverUrl != null && authorization != null) serverUrl to authorization else null
+            if (ArtworkProvider.session != session || session == null) {
+                File(cacheDir, "android-auto-artwork").deleteRecursively()
+            }
+            ArtworkProvider.session = session
             result.success(null)
         }
     }
@@ -60,6 +82,7 @@ class MainActivity : AudioServiceActivity() {
 
 class ArtworkProvider : ContentProvider() {
     companion object {
+        @Volatile var session: Pair<String, String>? = null
         private val itemIdPattern = Regex("[A-Za-z0-9-]+")
         private val lock = Any()
         private const val maxArtworkBytes = 10 * 1024 * 1024
@@ -74,9 +97,7 @@ class ArtworkProvider : ContentProvider() {
         val itemId = uri.lastPathSegment?.takeIf(itemIdPattern::matches)
             ?: throw FileNotFoundException("Invalid artwork ID")
         val context = context ?: throw FileNotFoundException("No app context")
-        val serverUrl = context.getSharedPreferences("android_auto", 0)
-            .getString("server_url", null)
-            ?: throw FileNotFoundException("No Jellyfin server")
+        val (serverUrl, authorization) = session ?: throw FileNotFoundException("No Jellyfin session")
         val server = Uri.parse(serverUrl)
         if (server.scheme !in setOf("http", "https") || server.host.isNullOrEmpty() ||
             !server.userInfo.isNullOrEmpty() || server.query != null || server.fragment != null) {
@@ -96,7 +117,7 @@ class ArtworkProvider : ContentProvider() {
 
         // ponytail: one download lock; split by artwork ID if car-grid throughput becomes measurable.
         synchronized(lock) {
-            if (!artwork.exists() || artwork.length() == 0L) download(URL(remote.toString()), artwork)
+            if (!artwork.exists() || artwork.length() == 0L) download(URL(remote.toString()), artwork, authorization)
         }
         return ParcelFileDescriptor.open(artwork, ParcelFileDescriptor.MODE_READ_ONLY)
     }
@@ -117,13 +138,15 @@ class ArtworkProvider : ContentProvider() {
         }
     }
 
-    private fun download(remote: URL, artwork: File) {
+    private fun download(remote: URL, artwork: File, authorization: String) {
         val temporary = File(artwork.parentFile, "${artwork.name}.tmp")
         val connection = remote.openConnection() as HttpURLConnection
         try {
             connection.connectTimeout = 10_000
             connection.readTimeout = 20_000
             connection.setRequestProperty("Accept", "image/*")
+            connection.setRequestProperty("Authorization", authorization)
+            connection.instanceFollowRedirects = false
             if (connection.responseCode !in 200..299 ||
                 !connection.contentType.orEmpty().startsWith("image/")) {
                 throw FileNotFoundException("Artwork download failed")

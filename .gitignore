@@ -44,3 +44,10 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Independently versioned website
+/website/
+/audit/results/
+/integration_test/local_config.json
+
+/android/build/

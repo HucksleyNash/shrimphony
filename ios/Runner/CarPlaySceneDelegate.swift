@@ -7,6 +7,8 @@ struct CarPlayItem {
   let title: String
   let subtitle: String?
   let browsable: Bool
+  let artworkUri: String?
+  let artworkHeaders: [String: String]?
 }
 
 final class CarPlayBridge {
@@ -35,7 +37,7 @@ final class CarPlayBridge {
     }
   }
 
-  func catalog(id: String, retries: Int = 20, completion: @escaping ([CarPlayItem]) -> Void) {
+  func catalog(id: String, retries: Int = 20, completion: @escaping ([CarPlayItem], String?) -> Void) {
     guard let channel else {
       whenConnected { [weak self] in self?.catalog(id: id, completion: completion) }
       return
@@ -49,6 +51,14 @@ final class CarPlayBridge {
         return
       }
 
+      if let error = result as? FlutterError {
+        DispatchQueue.main.async { completion([], error.message ?? "Could not load music. Retry when connected.") }
+        return
+      }
+      if result as? NSObject === FlutterMethodNotImplemented {
+        DispatchQueue.main.async { completion([], "Open Shrimphony on your phone, then retry.") }
+        return
+      }
       let items = (result as? [[String: Any]] ?? []).compactMap { value -> CarPlayItem? in
         guard let id = value["id"] as? String,
               let title = value["title"] as? String else { return nil }
@@ -56,15 +66,20 @@ final class CarPlayBridge {
           id: id,
           title: title,
           subtitle: value["subtitle"] as? String,
-          browsable: value["browsable"] as? Bool ?? false
+          browsable: value["browsable"] as? Bool ?? false,
+          artworkUri: value["artworkUri"] as? String,
+          artworkHeaders: value["artworkHeaders"] as? [String: String]
         )
       }
-      DispatchQueue.main.async { completion(items) }
+      DispatchQueue.main.async { completion(items, nil) }
     }
   }
 
-  func play(id: String) {
-    channel?.invokeMethod("play", arguments: ["id": id])
+  func play(id: String, completion: @escaping (String?) -> Void) {
+    guard let channel else { completion("Open Shrimphony on your phone first."); return }
+    channel.invokeMethod("play", arguments: ["id": id]) { result in
+      completion((result as? FlutterError)?.message)
+    }
   }
 }
 
@@ -93,8 +108,9 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
   }
 
   private func showCatalog(id: String, title: String, asRoot: Bool = false) {
-    CarPlayBridge.shared.catalog(id: id) { [weak self] items in
+    CarPlayBridge.shared.catalog(id: id) { [weak self] items, error in
       guard let self, let interfaceController else { return }
+      if let error { self.showError(error) { self.showCatalog(id: id, title: title, asRoot: asRoot) }; return }
       let template = self.makeTemplate(title: title, items: items)
       if asRoot {
         interfaceController.setRootTemplate(template, animated: false) { _, _ in }
@@ -104,19 +120,47 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
     }
   }
 
+  private func showError(_ message: String, retry: @escaping () -> Void) {
+    let alert = CPAlertTemplate(titleVariants: [message], actions: [
+      CPAlertAction(title: "Retry", style: .default) { [weak self] _ in
+        self?.interfaceController?.dismissTemplate(animated: true) { _, _ in retry() }
+      },
+      CPAlertAction(title: "Cancel", style: .cancel) { [weak self] _ in
+        self?.interfaceController?.dismissTemplate(animated: true) { _, _ in }
+      }
+    ])
+    interfaceController?.presentTemplate(alert, animated: true) { _, _ in }
+  }
+
+  private func play(_ id: String, completion: @escaping () -> Void) {
+    CarPlayBridge.shared.play(id: id) { [weak self] error in
+      if let error { self?.showError(error) { self?.play(id, completion: {}) } }
+      else { self?.interfaceController?.pushTemplate(CPNowPlayingTemplate.shared, animated: true) { _, _ in } }
+      completion()
+    }
+  }
+
   private func makeTemplate(title: String, items: [CarPlayItem]) -> CPListTemplate {
     let rows = items.map { item in
       let row = CPListItem(text: item.title, detailText: item.subtitle)
+      if let text = item.artworkUri, let url = URL(string: text) {
+        if url.isFileURL { row.setImage(UIImage(contentsOfFile: url.path)) }
+        else if ["http", "https"].contains(url.scheme ?? "") {
+          var request = URLRequest(url: url)
+          request.allHTTPHeaderFields = item.artworkHeaders
+          URLSession.shared.dataTask(with: request) { data, _, _ in
+            guard let data, let image = UIImage(data: data) else { return }
+            DispatchQueue.main.async { row.setImage(image) }
+          }.resume()
+        }
+      }
       row.accessoryType = item.browsable ? .disclosureIndicator : .none
       row.handler = { [weak self] _, completion in
         if item.browsable {
           self?.showCatalog(id: item.id, title: item.title)
         } else {
-          CarPlayBridge.shared.play(id: item.id)
-          self?.interfaceController?.pushTemplate(
-            CPNowPlayingTemplate.shared,
-            animated: true
-          ) { _, _ in }
+          self?.play(item.id, completion: completion)
+          return
         }
         completion()
       }

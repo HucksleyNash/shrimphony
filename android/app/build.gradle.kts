@@ -1,7 +1,17 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
+}
+
+val signingProperties = Properties()
+val signingFile = rootProject.file("key.properties")
+if (signingFile.exists()) signingFile.inputStream().use(signingProperties::load)
+val releaseRequested = gradle.startParameter.taskNames.any { it.contains("release", ignoreCase = true) }
+if (releaseRequested && !signingFile.exists() && project.findProperty("allowUnsignedRelease") != "true") {
+    throw GradleException("Release signing is missing. Copy key.properties.example to key.properties and configure your private release key. For a compile-only unsigned artifact, use -PallowUnsignedRelease=true.")
 }
 
 android {
@@ -22,10 +32,17 @@ android {
         versionName = flutter.versionName
     }
 
+    signingConfigs {
+        if (signingFile.exists()) create("release") {
+            keyAlias = signingProperties.getProperty("keyAlias")
+            keyPassword = signingProperties.getProperty("keyPassword")
+            storeFile = rootProject.file(signingProperties.getProperty("storeFile"))
+            storePassword = signingProperties.getProperty("storePassword")
+        }
+    }
     buildTypes {
         release {
-            // Local release-mode runs only; distribution requires a release key.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (signingFile.exists()) signingConfigs.getByName("release") else null
         }
     }
 }

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:math';
+import 'package:flutter/foundation.dart';
 
 import 'package:audio_service/audio_service.dart';
 import 'package:audio_session/audio_session.dart';
@@ -19,41 +20,6 @@ List<int>? validShuffleOrder(Object? value, int length) {
     return null;
   }
   return indices;
-}
-
-int? queuePageTrimCount(
-  int? currentIndex,
-  int queueLength, {
-  int loadAhead = 20,
-  int history = 10,
-}) {
-  if (currentIndex == null ||
-      currentIndex < 0 ||
-      currentIndex >= queueLength ||
-      queueLength - currentIndex - 1 > loadAhead) {
-    return null;
-  }
-  return max(0, currentIndex - history);
-}
-
-({List<T> items, int index}) boundedQueueWindow<T>(
-  List<T> items,
-  int index, {
-  int maxLength = 100,
-  int history = 10,
-}) {
-  if (maxLength < 1) throw ArgumentError.value(maxLength, 'maxLength');
-  if (items.isEmpty) return (items: const [], index: 0);
-  final safeIndex = index.clamp(0, items.length - 1).toInt();
-  if (items.length <= maxLength) return (items: items, index: safeIndex);
-  final start = min(
-    max(0, safeIndex - max(0, history)),
-    items.length - maxLength,
-  ).toInt();
-  return (
-    items: items.sublist(start, start + maxLength),
-    index: safeIndex - start,
-  );
 }
 
 List<MediaItem> vehicleRootItems() => const [
@@ -94,10 +60,19 @@ Uri vehicleArtworkUri(String itemId) => Uri(
 MediaItem vehiclePlayingMediaItem(
   JellyfinClient api,
   JellyfinItem item,
-  String id,
-) {
+  String id, {
+  Uri? artwork,
+  TargetPlatform? platform,
+}) {
   final artworkId = item.artworkId;
-  final localArtwork = artworkId == null ? null : vehicleArtworkUri(artworkId);
+  final android = (platform ?? defaultTargetPlatform) == TargetPlatform.android;
+  final localArtwork =
+      artwork ??
+      (artworkId == null
+          ? null
+          : android
+          ? vehicleArtworkUri(artworkId)
+          : api.imageUri(artworkId));
   return MediaItem(
     id: id,
     title: item.name,
@@ -108,8 +83,9 @@ MediaItem vehiclePlayingMediaItem(
     artHeaders: artworkId == null ? null : api.authorizationHeaders,
     extras: {
       'jellyfin': item.toJson(),
-      if (localArtwork != null)
+      if (android && localArtwork != null)
         'android.media.metadata.ALBUM_ART_URI': localArtwork.toString(),
+      if (artwork != null) 'localArtUri': artwork.toString(),
       if (artworkId != null) 'remoteArtUri': api.imageUri(artworkId).toString(),
     },
   );
@@ -119,6 +95,7 @@ MediaItem vehicleBrowserMediaItem(
   JellyfinClient api,
   JellyfinItem item, {
   String? groupTitle,
+  Uri? artwork,
 }) => MediaItem(
   id: '${item.type}:${item.id}',
   title: item.name,
@@ -126,10 +103,16 @@ MediaItem vehicleBrowserMediaItem(
   artist: item.artists.join(', '),
   displaySubtitle: item.subtitle,
   duration: item.duration,
-  artUri: switch (item.artworkId) {
-    final id? => vehicleArtworkUri(id),
-    null => null,
-  },
+  artHeaders: api.authorizationHeaders,
+  artUri:
+      artwork ??
+      switch (item.artworkId) {
+        final id? =>
+          defaultTargetPlatform == TargetPlatform.android
+              ? vehicleArtworkUri(id)
+              : api.imageUri(id),
+        null => null,
+      },
   playable: item.isAudio,
   extras: {
     'jellyfin': item.toJson(),
@@ -141,10 +124,11 @@ const _androidAutoChannel = MethodChannel(
   'com.thomaskleckner.shrimphony/android_auto',
 );
 
-Future<void> _configureVehicleArtwork(String? serverUrl) async {
+Future<void> _configureVehicleArtwork(JellyfinClient? api) async {
   try {
     await _androidAutoChannel.invokeMethod<void>('configureArtwork', {
-      'serverUrl': serverUrl,
+      'serverUrl': api?.session.serverUrl,
+      'authorization': api?.authorizationHeaders.values.first,
     });
   } on MissingPluginException {
     // Android-only integration.
@@ -153,39 +137,22 @@ Future<void> _configureVehicleArtwork(String? serverUrl) async {
   }
 }
 
-class _RestoredShuffleOrder extends DefaultShuffleOrder {
-  _RestoredShuffleOrder(this._restored);
-
-  final List<int> _restored;
-  bool _used = false;
-
-  @override
-  void insert(int index, int count) {
-    if (!_used && index == 0 && count == _restored.length) {
-      indices.addAll(_restored);
-      _used = true;
-      return;
-    }
-    super.insert(index, count);
-  }
-}
-
 class JellyfinAudioHandler extends BaseAudioHandler
     with QueueHandler, SeekHandler {
-  JellyfinAudioHandler(this._store)
-    : _player = AudioPlayer(
-        userAgent: '$appName/$appVersion',
-        maxSkipsOnError: 3,
-      ) {
+  JellyfinAudioHandler(this._store, {AudioPlayer? player})
+    : _player =
+          player ??
+          AudioPlayer(
+            userAgent: '$appName/$appVersion',
+            maxSkipsOnError: 0,
+            useProxyForRequestHeaders: false,
+          ) {
     _player.playbackEventStream.listen(
       (_) => _broadcastState(),
       onError: (Object error, StackTrace stack) {
-        playbackState.add(
-          playbackState.value.copyWith(
-            processingState: AudioProcessingState.error,
-            errorMessage: 'Playback failed: $error',
-          ),
-        );
+        _playbackError =
+            'Playback failed. Check your connection, then retry or skip.';
+        _broadcastState();
       },
     );
     _player.currentIndexStream.listen(_onIndexChanged);
@@ -197,15 +164,18 @@ class JellyfinAudioHandler extends BaseAudioHandler
   final AudioPlayer _player;
   final Completer<void> _initialized = Completer<void>();
   JellyfinClient? _client;
+  bool _clientAttached = false;
+  bool _disposed = false;
   Timer? _progressTimer;
   Timer? _saveTimer;
   Future<void> _clientTransition = Future.value();
-  Future<void> _batchAppend = Future.value();
-  StreamIterator<List<JellyfinItem>>? _shufflePages;
-  final Set<String> _shuffleSeen = {};
-  bool _loadingShufflePage = false;
+  Future<void> _queueChanges = Future.value();
+  bool _loadingLibraryQueue = false;
+  Map<String, Uri> _artwork = const {};
+  String? _playbackError;
+  bool _persistenceFailed = false;
   bool _mutatingQueue = false;
-  bool _pagedShuffle = false;
+  bool _shuffled = false;
   int _queueGeneration = 0;
   int _nextQueueItemId = 0;
   String? _reportedQueueId;
@@ -224,8 +194,12 @@ class JellyfinAudioHandler extends BaseAudioHandler
       // The phone UI owns sign-in errors; background audio must not block launch.
       _client = null;
     }
-    await _configureVehicleArtwork(_client?.session.serverUrl);
-    await _restoreQueue();
+    await _configureVehicleArtwork(_client);
+    try {
+      await _restoreQueue();
+    } on Object {
+      _playbackError = 'Saved playback could not load. Retry or choose a song.';
+    }
     _broadcastState();
     _initialized.complete();
     _progressTimer = Timer.periodic(const Duration(seconds: 10), (_) {
@@ -235,9 +209,10 @@ class JellyfinAudioHandler extends BaseAudioHandler
   }
 
   void attachClient(JellyfinClient? value) {
+    _clientAttached = true;
     final previous = _client;
     _client = value;
-    unawaited(_configureVehicleArtwork(value?.session.serverUrl));
+    unawaited(_configureVehicleArtwork(value));
     if (!_sameSession(previous?.session, value?.session)) {
       _reportedQueueId = null;
       _reportedItemId = null;
@@ -261,35 +236,41 @@ class JellyfinAudioHandler extends BaseAudioHandler
     if (api == null) {
       throw const JellyfinException('Sign in before playing music.');
     }
-    await _cancelShufflePaging();
     final generation = ++_queueGeneration;
     final requestedIndex = initialIndex?.clamp(0, items.length - 1);
     final playbackItems = shuffle ? materializedShuffle(items) : items;
     final safeIndex = requestedIndex == null
         ? 0
         : playbackItems.indexOf(items[requestedIndex]);
+    final sources = await _audioSources(api, playbackItems);
     final mediaItems = playbackItems
         .map((item) => _queueMediaItem(api, item))
         .toList();
-    final sources = await _audioSources(api, playbackItems);
     _reportedPosition = _player.position;
-    await _reportStopped();
-    await _batchAppend;
+    unawaited(_reportStopped());
+    await _queueChanges;
     if (generation != _queueGeneration) return;
-    queue.add(mediaItems);
-    await _player.setAudioSources(
-      sources,
-      initialIndex: safeIndex,
-      initialPosition: Duration.zero,
-      preload: true,
-      shuffleOrder: DefaultShuffleOrder(),
-    );
-    await setShuffleMode(
-      shuffle ? AudioServiceShuffleMode.all : AudioServiceShuffleMode.none,
-    );
-    mediaItem.add(mediaItems[safeIndex]);
-    await play();
-    _scheduleSave();
+    await _editQueue(() async {
+      if (generation != _queueGeneration) return;
+      _shuffled = shuffle;
+      _playbackError = null;
+      queue.add(mediaItems);
+      mediaItem.add(mediaItems[safeIndex]);
+      try {
+        await _player.setShuffleModeEnabled(false);
+        await _player.setAudioSources(
+          sources,
+          initialIndex: safeIndex,
+          initialPosition: Duration.zero,
+          preload: true,
+        );
+      } on Object {
+        _playbackError =
+            'Playback failed. Check your connection, then retry or skip.';
+        rethrow;
+      }
+    });
+    if (generation == _queueGeneration) await play();
   }
 
   Future<void> playItem(JellyfinItem item, {List<JellyfinItem>? context}) {
@@ -301,75 +282,127 @@ class JellyfinAudioHandler extends BaseAudioHandler
     return playItems(items, initialIndex: index < 0 ? 0 : index);
   }
 
+  Future<void> _editQueue(Future<void> Function() edit) {
+    final api = _client;
+    final operation = _queueChanges.then((_) async {
+      if (!identical(api, _client)) return;
+      _mutatingQueue = true;
+      try {
+        await edit();
+      } finally {
+        _mutatingQueue = false;
+        if (queue.value.isEmpty) {
+          mediaItem.add(null);
+        } else {
+          _onIndexChanged(_player.currentIndex);
+        }
+        _broadcastState();
+        if (identical(api, _client)) await _persist();
+      }
+    });
+    _queueChanges = operation.then<void>((_) {}, onError: (_, _) {});
+    return operation;
+  }
+
   Future<void> playNext(JellyfinItem item) async {
     await _awaitClientTransition();
     final api = await _ensureClient();
-    if (api == null) return;
-    final index = (_player.currentIndex ?? -1) + 1;
-    await _player.insertAudioSource(
-      index.clamp(0, _player.sequence.length),
-      await _audioSource(api, item),
-    );
-    final updated = [...queue.value];
-    updated.insert(index.clamp(0, updated.length), _queueMediaItem(api, item));
-    queue.add(updated);
-    _scheduleSave();
+    if (api == null || !item.isAudio) return;
+    final source = await _audioSource(api, item);
+    await _editQueue(() async {
+      final index = ((_player.currentIndex ?? -1) + 1).clamp(
+        0,
+        queue.value.length,
+      );
+      await _player.insertAudioSource(index, source);
+      final updated = [...queue.value]
+        ..insert(index, _queueMediaItem(api, item));
+      queue.add(updated);
+    });
   }
 
   Future<void> clearQueue() async {
     await _awaitClientTransition();
     ++_queueGeneration;
-    await _cancelShufflePaging();
-    await _batchAppend;
-    _reportedPosition = _player.position;
-    await _reportStopped();
-    await _player.stop();
-    await _player.clearAudioSources();
-    queue.add(const []);
-    mediaItem.add(null);
-    await _persist();
-    _broadcastState();
+    await _editQueue(() async {
+      _reportedPosition = _player.position;
+      unawaited(_reportStopped());
+      await _player.stop();
+      await _player.clearAudioSources();
+      queue.add(const []);
+      _playbackError = null;
+    });
   }
 
   @override
   Future<void> addQueueItem(MediaItem mediaItem) async {
-    await _awaitClientTransition();
-    final api = await _ensureClient();
     final original = _original(mediaItem);
-    if (api == null || original == null) return;
-    await _player.addAudioSource(await _audioSource(api, original));
-    queue.add([...queue.value, mediaItem]);
-    _scheduleSave();
+    if (original != null) await addItemToQueue(original);
   }
 
   Future<void> addItemToQueue(JellyfinItem item) async {
+    await _awaitClientTransition();
     final api = await _ensureClient();
-    if (api == null) return;
-    await addQueueItem(_queueMediaItem(api, item));
+    if (api == null || !item.isAudio) return;
+    final source = await _audioSource(api, item);
+    await _editQueue(() async {
+      await _player.addAudioSource(source);
+      queue.add([...queue.value, _queueMediaItem(api, item)]);
+    });
   }
 
   @override
   Future<void> removeQueueItem(MediaItem mediaItem) async {
     await _awaitClientTransition();
-    final index = queue.value.indexOf(mediaItem);
-    if (index < 0) return;
-    await _player.removeAudioSourceAt(index);
-    final updated = [...queue.value]..removeAt(index);
-    queue.add(updated);
-    _scheduleSave();
+    await _editQueue(() async {
+      final index = queue.value.indexWhere((value) => value.id == mediaItem.id);
+      if (index < 0) return;
+      await _player.removeAudioSourceAt(index);
+      queue.add([...queue.value]..removeAt(index));
+    });
   }
 
   Future<void> moveQueueItem(int oldIndex, int newIndex) async {
     await _awaitClientTransition();
-    if (oldIndex < 0 || oldIndex >= queue.value.length) return;
-    final destination = newIndex.clamp(0, queue.value.length - 1);
-    if (oldIndex == destination) return;
-    await _player.moveAudioSource(oldIndex, destination);
-    final updated = [...queue.value];
-    final item = updated.removeAt(oldIndex);
-    updated.insert(destination, item);
-    queue.add(updated);
-    _scheduleSave();
+    await _editQueue(() async {
+      if (oldIndex < 0 || oldIndex >= queue.value.length) return;
+      final destination = newIndex.clamp(0, queue.value.length - 1);
+      if (oldIndex == destination) return;
+      await _player.moveAudioSource(oldIndex, destination);
+      final updated = [...queue.value];
+      updated.insert(destination, updated.removeAt(oldIndex));
+      queue.add(updated);
+    });
+  }
+
+  Future<void> retryPlayback() async {
+    await _awaitClientTransition();
+    final api = await _ensureClient();
+    if (api == null || queue.value.isEmpty) return;
+    await _editQueue(() async {
+      _playbackError = null;
+      final items = queue.value
+          .map(_original)
+          .whereType<JellyfinItem>()
+          .toList();
+      final index =
+          (_player.currentIndex ?? playbackState.value.queueIndex ?? 0).clamp(
+            0,
+            items.length - 1,
+          );
+      try {
+        await _player.setAudioSources(
+          await _audioSources(api, items),
+          initialIndex: index,
+          initialPosition: _player.position,
+        );
+      } on Object {
+        _playbackError =
+            'Playback failed. Check your connection, then retry or skip.';
+        rethrow;
+      }
+    });
+    await play();
   }
 
   @override
@@ -377,15 +410,35 @@ class JellyfinAudioHandler extends BaseAudioHandler
     await _initialized.future;
     await _awaitClientTransition();
     if (_player.sequence.isEmpty) return;
-    unawaited(_player.play());
-    await _report('progress');
+    if (_playbackError != null) {
+      await retryPlayback();
+      return;
+    }
+    if (_player.processingState == ProcessingState.idle) {
+      await _editQueue(() async {
+        final index = _player.currentIndex;
+        final position = _player.position;
+        await _player.load();
+        await _player.seek(position, index: index);
+      });
+    }
+    unawaited(
+      _player.play().catchError((Object error) {
+        _playbackError =
+            'Playback failed. Check your connection, then retry or skip.';
+        _broadcastState();
+      }),
+    );
+    unawaited(
+      _report(_reportedQueueId == mediaItem.value?.id ? 'progress' : 'start'),
+    );
   }
 
   @override
   Future<void> pause() async {
     await _awaitClientTransition();
     await _player.pause();
-    await _report('progress');
+    unawaited(_report('progress'));
     await _persist();
   }
 
@@ -393,7 +446,7 @@ class JellyfinAudioHandler extends BaseAudioHandler
   Future<void> stop() async {
     await _awaitClientTransition();
     _reportedPosition = _player.position;
-    await _reportStopped();
+    unawaited(_reportStopped());
     await _player.stop();
     await _persist();
     _broadcastState();
@@ -403,7 +456,7 @@ class JellyfinAudioHandler extends BaseAudioHandler
   Future<void> seek(Duration position) async {
     await _awaitClientTransition();
     await _player.seek(position);
-    await _report('progress');
+    unawaited(_report('progress'));
     _scheduleSave();
   }
 
@@ -412,6 +465,7 @@ class JellyfinAudioHandler extends BaseAudioHandler
     await _awaitClientTransition();
     if (index < 0 || index >= queue.value.length) return;
     _reportedPosition = _player.position;
+    _playbackError = null;
     await _player.seek(Duration.zero, index: index);
     _scheduleSave();
   }
@@ -421,6 +475,7 @@ class JellyfinAudioHandler extends BaseAudioHandler
     await _awaitClientTransition();
     if (_player.hasNext) {
       _reportedPosition = _player.position;
+      _playbackError = null;
       await _player.seekToNext();
     }
   }
@@ -440,17 +495,31 @@ class JellyfinAudioHandler extends BaseAudioHandler
   Future<void> setShuffleMode(AudioServiceShuffleMode shuffleMode) async {
     await _awaitClientTransition();
     final enabled = shuffleMode != AudioServiceShuffleMode.none;
-    if (_shufflePages != null || _pagedShuffle) {
-      _pagedShuffle = enabled;
+    if (enabled == _shuffled) return;
+    await _editQueue(() async {
+      _shuffled = enabled;
+      if (enabled && queue.value.length > 1) {
+        final index = _player.currentIndex ?? 0;
+        final updated = [
+          ...queue.value.take(index + 1),
+          ...materializedShuffle(queue.value.skip(index + 1)),
+        ];
+        final byId = {
+          for (var i = 0; i < queue.value.length; i++)
+            queue.value[i].id: _player.audioSources[i],
+        };
+        final sources = [for (final item in updated) byId[item.id]!];
+        final position = _player.position;
+        queue.add(updated);
+        await _player.setAudioSources(
+          sources,
+          initialIndex: index,
+          initialPosition: position,
+        );
+      }
+      // The displayed queue is the play order, including explicit edits after shuffle.
       await _player.setShuffleModeEnabled(false);
-      playbackState.add(playbackState.value.copyWith(shuffleMode: shuffleMode));
-      _scheduleSave();
-      return;
-    }
-    if (enabled) await _player.shuffle();
-    await _player.setShuffleModeEnabled(enabled);
-    playbackState.add(playbackState.value.copyWith(shuffleMode: shuffleMode));
-    _scheduleSave();
+    });
   }
 
   @override
@@ -468,6 +537,32 @@ class JellyfinAudioHandler extends BaseAudioHandler
 
   @override
   Future<List<MediaItem>> getChildren(
+    String parentMediaId, [
+    Map<String, dynamic>? options,
+  ]) async {
+    var parent = parentMediaId;
+    var offset = 0;
+    if (parent.startsWith('page:')) {
+      final separator = parent.indexOf(':', 5);
+      if (separator < 0) return [];
+      offset = int.tryParse(parent.substring(5, separator)) ?? 0;
+      parent = parent.substring(separator + 1);
+    }
+    if (offset < 0) return [];
+    final items = await _getChildren(parent, options);
+    const pageSize = 80;
+    return [
+      ...items.skip(offset).take(pageSize),
+      if (offset + pageSize < items.length)
+        MediaItem(
+          id: 'page:${offset + pageSize}:$parent',
+          title: 'More',
+          playable: false,
+        ),
+    ];
+  }
+
+  Future<List<MediaItem>> _getChildren(
     String parentMediaId, [
     Map<String, dynamic>? options,
   ]) async {
@@ -510,6 +605,8 @@ class JellyfinAudioHandler extends BaseAudioHandler
         MediaItem(id: 'browse:albums', title: 'Albums', playable: false),
         MediaItem(id: 'browse:artists', title: 'Artists', playable: false),
         MediaItem(id: 'browse:genres', title: 'Genres', playable: false),
+        MediaItem(id: 'browse:playlists', title: 'Playlists', playable: false),
+        MediaItem(id: 'browse:downloads', title: 'Downloads', playable: false),
       ];
     }
     if (parentMediaId == 'browse:shuffle') {
@@ -523,6 +620,35 @@ class JellyfinAudioHandler extends BaseAudioHandler
     }
     final api = await _ensureClient();
     if (api == null) return const [];
+    if (parentMediaId == 'browse:downloads' ||
+        parentMediaId.startsWith('offline:')) {
+      final catalog = parentMediaId == 'browse:downloads'
+          ? await _store.offlineCatalog(api.session)
+          : await _store.collectionItems(
+              api,
+              JellyfinItem(
+                id: _parseBrowserId(parentMediaId.substring(8))?.$2 ?? '',
+                name: '',
+                type: _parseBrowserId(parentMediaId.substring(8))?.$1 ?? '',
+              ),
+              offlineOnly: true,
+            );
+      final artwork = await _store.downloadedArtwork(api.session);
+      return [
+        if (parentMediaId.startsWith('offline:'))
+          MediaItem(
+            id: 'action:offline:${parentMediaId.substring(8)}',
+            title: 'Play downloaded songs',
+            playable: true,
+          ),
+        for (final item in catalog)
+          vehicleBrowserMediaItem(
+            api,
+            item,
+            artwork: artwork[item.artworkId],
+          ).copyWith(id: 'offline:${item.type}:${item.id}'),
+      ];
+    }
     if (parentMediaId == 'browse:home') {
       final sections = await Future.wait([
         api.recentlyAdded(limit: 10),
@@ -545,17 +671,24 @@ class JellyfinAudioHandler extends BaseAudioHandler
     final items = switch (parentMediaId) {
       'browse:recent' => await api.recentlyPlayed(limit: 30),
       'browse:added' => await api.recentlyAdded(limit: 30),
-      'browse:favorites' => await api.favorites(limit: 50),
-      'browse:albums' => await api.albums(limit: 100),
-      'browse:artists' => await api.artists(limit: 100),
-      'browse:playlists' => await api.playlists(limit: 100),
-      'browse:genres' => await api.genres(limit: 100),
+      'browse:favorites' => await api.favorites(),
+      'browse:albums' => await api.albums(),
+      'browse:artists' => await api.artists(),
+      'browse:playlists' => await api.playlists(),
+      'browse:genres' => await api.genres(),
       'browse:downloads' => (await _store.loadDownloads(api.session)).items,
       _ => await _childrenForBrowserId(api, parentMediaId),
     };
     final parsed = _parseBrowserId(parentMediaId);
     return [
-      if (parsed != null && parsed.$1 != 'Audio')
+      if (parsed != null &&
+          const {
+            'MusicAlbum',
+            'MusicArtist',
+            'Artist',
+            'MusicGenre',
+            'Playlist',
+          }.contains(parsed.$1))
         ...vehicleCollectionActions(parsed.$1, parsed.$2),
       ...items.map((item) => vehicleBrowserMediaItem(api, item)),
     ];
@@ -569,10 +702,22 @@ class JellyfinAudioHandler extends BaseAudioHandler
     await _initialized.future;
     final api = await _ensureClient();
     if (api == null) return const [];
-    return (await api.search(
-      query,
-      limit: 30,
-    )).map((item) => vehicleBrowserMediaItem(api, item)).toList();
+    try {
+      return (await api.search(
+        query,
+        limit: 60,
+      )).map((item) => vehicleBrowserMediaItem(api, item)).toList();
+    } on JellyfinException catch (error) {
+      if (error.isAuthenticationError) rethrow;
+      return searchLocalMusic(await _store.offlineCatalog(api.session), query)
+          .map(
+            (item) => vehicleBrowserMediaItem(
+              api,
+              item,
+            ).copyWith(id: 'offline:${item.type}:${item.id}'),
+          )
+          .toList();
+    }
   }
 
   @override
@@ -587,7 +732,7 @@ class JellyfinAudioHandler extends BaseAudioHandler
     }
     final results = await search(query, extras);
     if (results.isEmpty) return;
-    final firstSong = results.where((item) => item.id.startsWith('Audio:'));
+    final firstSong = results.where((item) => item.playable == true);
     await playFromMediaId(
       firstSong.isEmpty ? results.first.id : firstSong.first.id,
     );
@@ -601,12 +746,34 @@ class JellyfinAudioHandler extends BaseAudioHandler
     await _initialized.future;
     final api = await _ensureClient();
     if (api == null) return;
+    if (mediaId.startsWith('offline:') ||
+        mediaId.startsWith('action:offline:')) {
+      final parsed = _parseBrowserId(
+        mediaId.substring(mediaId.startsWith('action:') ? 15 : 8),
+      );
+      if (parsed == null) return;
+      final (type, id) = parsed;
+      final items = type == 'Audio'
+          ? (await _store.loadDownloads(
+              api.session,
+            )).items.where((item) => item.id == id).toList()
+          : await _store.collectionItems(
+              api,
+              JellyfinItem(id: id, name: '', type: type),
+              offlineOnly: true,
+            );
+      if (items.isEmpty) {
+        throw const JellyfinException('This music is not downloaded.');
+      }
+      await playItems(items);
+      return;
+    }
     if (mediaId == 'action:resume') {
       await play();
       return;
     }
     if (mediaId == 'action:shuffle') {
-      await _shuffleAll(api);
+      await shuffleLibrary();
       return;
     }
     if (mediaId.startsWith('action:mix:')) {
@@ -631,6 +798,8 @@ class JellyfinAudioHandler extends BaseAudioHandler
             'title': item.title,
             'subtitle': item.displaySubtitle ?? item.artist ?? item.album ?? '',
             'browsable': item.playable == false,
+            'artworkUri': item.artUri?.toString(),
+            'artworkHeaders': item.artHeaders,
           },
         )
         .toList();
@@ -656,7 +825,7 @@ class JellyfinAudioHandler extends BaseAudioHandler
   }
 
   Future<JellyfinClient?> _ensureClient() async {
-    if (_client != null) return _client;
+    if (_client != null || _clientAttached) return _client;
     final session = await _store.load();
     if (session == null) return null;
     final preferences = await _store.loadPreferences(session);
@@ -671,113 +840,68 @@ class JellyfinAudioHandler extends BaseAudioHandler
 
   Future<void> _clearPlayer() async {
     ++_queueGeneration;
-    await _cancelShufflePaging();
-    await _batchAppend;
+    await _queueChanges;
     await _player.stop();
     await _player.clearAudioSources();
     _broadcastState();
   }
 
-  Future<void> _shuffleAll(JellyfinClient api) async {
-    final initial = materializedShuffle(await api.randomSongs());
-    if (initial.isEmpty) return;
-    final previousGeneration = _queueGeneration;
-    await playItems(initial);
-    final generation = _queueGeneration;
-    if (generation != previousGeneration + 1 || !identical(api, _client)) {
-      return;
-    }
-    _shuffleSeen
-      ..clear()
-      ..addAll(initial.map((item) => item.id));
-    _shufflePages = StreamIterator(api.songBatches(batchSize: 100));
-    _pagedShuffle = true;
-    _broadcastState();
-  }
-
-  Future<void> _loadNextShufflePage() async {
-    final pages = _shufflePages;
-    final api = _client;
-    final generation = _queueGeneration;
-    if (_loadingShufflePage || pages == null || api == null) return;
-    bool current() =>
-        generation == _queueGeneration &&
-        identical(api, _client) &&
-        identical(pages, _shufflePages);
-    _loadingShufflePage = true;
+  Future<void> shuffleLibrary() async {
+    await _awaitClientTransition();
+    final api = await _ensureClient();
+    if (api == null) return;
     try {
-      while (current() && await pages.moveNext()) {
-        final additions = materializedShuffle(
-          pages.current
-              .where((item) => item.isAudio && _shuffleSeen.add(item.id))
-              .toList(),
-        );
-        if (additions.isEmpty) continue;
-        final sources = await _audioSources(api, additions);
-        if (!current()) return;
-        final operation = _appendShufflePage(
-          api,
-          generation,
-          additions,
-          sources,
-        );
-        _batchAppend = operation.then<void>((_) {}, onError: (_, _) {});
-        await operation;
-        return;
-      }
-      if (current()) {
-        _shufflePages = null;
-        await pages.cancel();
-      }
-    } on Object catch (error) {
-      if (current()) {
-        _shufflePages = null;
-        customEvent.add({'type': 'queueLoadingError', 'message': '$error'});
-        await pages.cancel();
-      }
-    } finally {
-      _loadingShufflePage = false;
+      final initial = await api.randomSongs();
+      await playItems(initial, shuffle: true);
+      final generation = _queueGeneration;
+      _loadingLibraryQueue = true;
+      unawaited(_appendLibrary(api, initial, generation));
+    } on JellyfinException catch (error) {
+      if (error.isAuthenticationError) rethrow;
+      final offline = (await _store.loadDownloads(api.session)).items;
+      if (offline.isEmpty) rethrow;
+      await playItems(offline, shuffle: true);
     }
   }
 
-  Future<void> _appendShufflePage(
+  Future<void> _appendLibrary(
     JellyfinClient api,
+    List<JellyfinItem> initial,
     int generation,
-    List<JellyfinItem> additions,
-    List<AudioSource> sources,
   ) async {
-    bool current() => generation == _queueGeneration && identical(api, _client);
-    if (!current()) return;
-    final currentIndex = _player.currentIndex ?? 0;
-    final trim = min(max(0, currentIndex - 10), queue.value.length);
-    var updated = queue.value;
-    _mutatingQueue = true;
+    final seen = initial.map((item) => item.id).toSet();
     try {
-      if (trim > 0) {
-        await _player.removeAudioSourceRange(0, trim);
-        if (!current()) return;
-        updated = updated.sublist(trim);
-        queue.add(updated);
+      await for (final batch in api.songBatches()) {
+        if (generation != _queueGeneration || !identical(api, _client)) return;
+        final additions = materializedShuffle(
+          batch.where((item) => seen.add(item.id)),
+        );
+        final sources = await _audioSources(api, additions);
+        await _editQueue(() async {
+          if (generation != _queueGeneration || !identical(api, _client)) {
+            return;
+          }
+          await _player.addAudioSources(sources);
+          queue.add([
+            ...queue.value,
+            ...additions.map((item) => _queueMediaItem(api, item)),
+          ]);
+        });
       }
-      await _player.addAudioSources(sources);
-      if (!current()) return;
-      queue.add([
-        ...updated,
-        ...additions.map((item) => _queueMediaItem(api, item)),
-      ]);
-      _scheduleSave();
+    } on Object {
+      if (generation == _queueGeneration) {
+        customEvent.add({
+          'type': 'queueLoadingError',
+          'message':
+              'The rest of the library could not load. Retry Shuffle your library when connected.',
+        });
+      }
     } finally {
-      _mutatingQueue = false;
-      if (current()) _onIndexChanged(_player.currentIndex);
+      if (generation == _queueGeneration) {
+        _loadingLibraryQueue = false;
+        await _persist();
+      }
     }
-  }
-
-  Future<void> _cancelShufflePaging() async {
-    final pages = _shufflePages;
-    _shufflePages = null;
-    _pagedShuffle = false;
-    _shuffleSeen.clear();
-    if (pages != null) await pages.cancel();
   }
 
   Future<void> _replaceClient(JellyfinClient? value) async {
@@ -800,26 +924,28 @@ class JellyfinAudioHandler extends BaseAudioHandler
     final parsed = _parseBrowserId(mediaId);
     if (parsed == null) return const [];
     final (type, id) = parsed;
-    return switch (type) {
-      'MusicArtist' => api.albumsForArtist(id),
-      'MusicGenre' => api.songsForGenre(id),
-      'Playlist' => api.playlistItems(id),
-      _ => api.children(id),
-    };
+    return _store.collectionItems(
+      api,
+      JellyfinItem(id: id, name: '', type: type),
+    );
   }
 
   Future<List<JellyfinItem>> _playableItemsForBrowserId(
     JellyfinClient api,
     String type,
     String id,
-  ) => switch (type) {
-    'Audio' => api.item(id).then((item) => [item]),
-    'MusicAlbum' => api.children(id),
-    'MusicArtist' => api.songsForArtist(id),
-    'MusicGenre' => api.songsForGenre(id),
-    'Playlist' => api.playlistItems(id),
-    _ => Future.value(const []),
-  };
+  ) async {
+    if (type == 'Audio') {
+      final local = (await _store.loadDownloads(
+        api.session,
+      )).items.where((item) => item.id == id);
+      return [local.firstOrNull ?? await api.item(id)];
+    }
+    return (await _store.collectionItems(
+      api,
+      JellyfinItem(id: id, name: '', type: type),
+    )).where((item) => item.isAudio).toList();
+  }
 
   (String, String)? _parseBrowserId(String mediaId) {
     final separator = mediaId.indexOf(':');
@@ -828,12 +954,18 @@ class JellyfinAudioHandler extends BaseAudioHandler
   }
 
   MediaItem _queueMediaItem(JellyfinClient api, JellyfinItem item) =>
-      vehiclePlayingMediaItem(api, item, 'queue:${_nextQueueItemId++}');
+      vehiclePlayingMediaItem(
+        api,
+        item,
+        'queue:${_nextQueueItemId++}',
+        artwork: _artwork[item.artworkId],
+      );
 
   Future<List<AudioSource>> _audioSources(
     JellyfinClient api,
     List<JellyfinItem> items,
   ) async {
+    _artwork = await _store.downloadedArtwork(api.session);
     final local = await _store.downloadedUris(
       api.session,
       items.map((item) => item.id),
@@ -845,6 +977,7 @@ class JellyfinAudioHandler extends BaseAudioHandler
     JellyfinClient api,
     JellyfinItem item,
   ) async {
+    _artwork = await _store.downloadedArtwork(api.session);
     final local = await _store.downloadedUris(api.session, [item.id]);
     return _sourceForUri(api, item, local[item.id]);
   }
@@ -854,7 +987,13 @@ class JellyfinAudioHandler extends BaseAudioHandler
     JellyfinItem item,
     Uri? local,
   ) => AudioSource.uri(
-    local ?? api.streamUri(item.id),
+    local ??
+        api.streamUri(
+          item.id,
+          sourceContainer: item.container,
+          mediaSourceId: item.mediaSourceId,
+          audioBitDepth: item.audioBitDepth,
+        ),
     headers: local == null ? api.authorizationHeaders : null,
     tag: item.id,
   );
@@ -866,22 +1005,18 @@ class JellyfinAudioHandler extends BaseAudioHandler
   }
 
   void _onIndexChanged(int? index) {
-    if (_mutatingQueue) return;
+    if (_disposed || _mutatingQueue) return;
     if (index == null || index < 0 || index >= queue.value.length) return;
     final next = queue.value[index];
     if (_reportedQueueId != null && _reportedQueueId != next.id) {
       unawaited(_reportStopped());
     }
     mediaItem.add(next);
-    if (_reportedQueueId != next.id) {
+    if (_player.playing && _reportedQueueId != next.id) {
       unawaited(_report('start'));
     }
     _broadcastState();
     _scheduleSave();
-    if (_shufflePages != null &&
-        queuePageTrimCount(index, queue.value.length) != null) {
-      unawaited(_loadNextShufflePage());
-    }
   }
 
   void _broadcastState() {
@@ -895,22 +1030,25 @@ class JellyfinAudioHandler extends BaseAudioHandler
         ],
         systemActions: const {MediaAction.seek},
         androidCompactActionIndices: const [0, 1, 2],
-        processingState: switch (_player.processingState) {
-          ProcessingState.idle =>
-            queue.value.isEmpty
-                ? AudioProcessingState.idle
-                : AudioProcessingState.ready,
-          ProcessingState.loading => AudioProcessingState.loading,
-          ProcessingState.buffering => AudioProcessingState.buffering,
-          ProcessingState.ready => AudioProcessingState.ready,
-          ProcessingState.completed => AudioProcessingState.completed,
-        },
+        errorMessage: _playbackError,
+        processingState: _playbackError != null
+            ? AudioProcessingState.error
+            : switch (_player.processingState) {
+                ProcessingState.idle =>
+                  queue.value.isEmpty
+                      ? AudioProcessingState.idle
+                      : AudioProcessingState.ready,
+                ProcessingState.loading => AudioProcessingState.loading,
+                ProcessingState.buffering => AudioProcessingState.buffering,
+                ProcessingState.ready => AudioProcessingState.ready,
+                ProcessingState.completed => AudioProcessingState.completed,
+              },
         playing: playing,
         updatePosition: _player.position,
         bufferedPosition: _player.bufferedPosition,
         speed: _player.speed,
         queueIndex: _player.currentIndex,
-        shuffleMode: _pagedShuffle || _player.shuffleModeEnabled
+        shuffleMode: _shuffled
             ? AudioServiceShuffleMode.all
             : AudioServiceShuffleMode.none,
         repeatMode: switch (_player.loopMode) {
@@ -931,14 +1069,15 @@ class JellyfinAudioHandler extends BaseAudioHandler
       _reportedQueueId = item.id;
       _reportedItemId = original.id;
     }
+    final position = _player.position;
+    _reportedPosition = position;
     try {
       await api.reportPlayback(
         event,
         original.id,
-        _player.position,
+        position,
         paused: !_player.playing,
       );
-      _reportedPosition = _player.position;
     } on Object catch (error) {
       customEvent.add({'type': 'reportingError', 'message': '$error'});
     }
@@ -958,6 +1097,7 @@ class JellyfinAudioHandler extends BaseAudioHandler
   }
 
   void _scheduleSave() {
+    if (_disposed) return;
     _saveTimer?.cancel();
     _saveTimer = Timer(
       const Duration(milliseconds: 500),
@@ -966,21 +1106,35 @@ class JellyfinAudioHandler extends BaseAudioHandler
   }
 
   Future<void> _persist() async {
+    if (_disposed || _mutatingQueue) return;
     final api = _client;
     if (api == null) return;
-    await _store.savePlayback({
-      'serverUrl': api.session.serverUrl,
-      'userId': api.session.userId,
-      'queue': [
-        for (final item in queue.value)
-          if (_original(item) case final original?) original.toJson(),
-      ],
-      'index': _player.currentIndex ?? 0,
-      'positionUs': _player.position.inMicroseconds,
-      'shuffle': _pagedShuffle || _player.shuffleModeEnabled,
-      'shuffleOrder': _player.shuffleIndices,
-      'repeat': _player.loopMode.name,
-    });
+    try {
+      await _store.savePlayback({
+        'serverUrl': api.session.serverUrl,
+        'userId': api.session.userId,
+        'queue': [
+          for (final item in queue.value)
+            if (_original(item) case final original?) original.toJson(),
+        ],
+        'index': _player.currentIndex ?? 0,
+        'positionUs': _player.position.inMicroseconds,
+        'shuffle': _shuffled,
+        'queueOrderVersion': 2,
+        'libraryQueueIncomplete': _loadingLibraryQueue,
+        'repeat': _player.loopMode.name,
+      });
+      _persistenceFailed = false;
+    } on Object {
+      if (!_persistenceFailed) {
+        customEvent.add({
+          'type': 'queueSaveError',
+          'message':
+              'Playback state could not be saved. Free device storage before closing the app.',
+        });
+      }
+      _persistenceFailed = true;
+    }
   }
 
   Future<void> _restoreQueue() async {
@@ -1003,28 +1157,32 @@ class JellyfinAudioHandler extends BaseAudioHandler
       0,
       items.length - 1,
     );
-    final savedLength = items.length;
-    final window = boundedQueueWindow(items, index);
-    items = window.items;
-    index = window.index;
+    if (saved['shuffle'] == true && saved['queueOrderVersion'] != 2) {
+      final order = validShuffleOrder(saved['shuffleOrder'], items.length);
+      if (order != null) {
+        items = [for (final oldIndex in order) items[oldIndex]];
+        index = order.indexOf(index);
+      }
+    }
     final position = Duration(
       microseconds: max(0, (saved['positionUs'] as num?)?.toInt() ?? 0),
     );
-    final shuffleOrder = savedLength == items.length
-        ? validShuffleOrder(saved['shuffleOrder'], items.length)
-        : null;
+    final sources = await _audioSources(api, items);
     queue.add(items.map((item) => _queueMediaItem(api, item)).toList());
+    mediaItem.add(queue.value[index]);
+    _shuffled = saved['shuffle'] == true;
+    await _player.setShuffleModeEnabled(false);
     await _player.setAudioSources(
-      await _audioSources(api, items),
+      sources,
       initialIndex: index,
       initialPosition: position,
       preload: false,
-      shuffleOrder: shuffleOrder == null
-          ? DefaultShuffleOrder()
-          : _RestoredShuffleOrder(shuffleOrder),
     );
-    if (saved['shuffle'] == true) {
-      await _player.setShuffleModeEnabled(true);
+    // just_audio leaves the idle player's cursor at zero until explicitly sought.
+    await _player.seek(position, index: index);
+    if (saved['libraryQueueIncomplete'] == true) {
+      _loadingLibraryQueue = true;
+      unawaited(_appendLibrary(api, items, _queueGeneration));
     }
     await _player.setLoopMode(switch (saved['repeat']) {
       'one' => LoopMode.one,
@@ -1037,12 +1195,14 @@ class JellyfinAudioHandler extends BaseAudioHandler
   }
 
   Future<void> disposePlayer() async {
+    if (_disposed) return;
+    _disposed = true;
     _progressTimer?.cancel();
     _saveTimer?.cancel();
     ++_queueGeneration;
-    await _cancelShufflePaging();
-    await _batchAppend;
-    await _reportStopped();
+    await _queueChanges;
+    unawaited(_reportStopped());
     await _player.dispose();
+    await _store.flushPlayback();
   }
 }

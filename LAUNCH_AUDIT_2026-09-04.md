@@ -2,6 +2,8 @@
 
 Audited September 4, 2026 · App version 1.0.0+1 · Android and iOS
 
+Implementation follow-up: [reliability fixes and acceptance evidence](LAUNCH_RELIABILITY_REPORT.md). The findings below preserve the original audit baseline; current dispositions and remaining launch gates are in that report.
+
 **Recommendation: finish a reliability release, then a focused feature-parity release. Shrimphony has a useful foundation, but it is not ready to claim “the most capable Jellyfin music player.”** Matching the main everyday workflows is achievable with the existing app. Matching the broadest competitors also requires substantial audio, casting, offline, and integration work.
 
 The strongest initial positioning is **a dependable Jellyfin music player across phone, car, and offline listening**. That is a proposed direction, not a verified market advantage. Car integration is already available elsewhere; its reliability and consistency would need to distinguish Shrimphony.

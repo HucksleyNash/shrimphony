@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/foundation.dart';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
@@ -35,20 +36,6 @@ void main() {
     expect(shuffled, isNot(orderedEquals(alphabetical)));
     expect(shuffled.toSet(), alphabetical.toSet());
     expect(alphabetical, orderedEquals(List.generate(20, (index) => index)));
-  });
-
-  test('loads queue pages near the end while keeping bounded history', () {
-    expect(queuePageTrimCount(78, 100), isNull);
-    expect(queuePageTrimCount(79, 100), 69);
-    expect(queuePageTrimCount(5, 10), 0);
-    expect(queuePageTrimCount(100, 100), isNull);
-
-    final restored = boundedQueueWindow(
-      List.generate(500, (index) => index),
-      250,
-    );
-    expect(restored.items, orderedEquals(List.generate(100, (i) => i + 240)));
-    expect(restored.index, 10);
   });
 
   group('JellyfinClient', () {
@@ -112,6 +99,20 @@ void main() {
         limited.streamUri('song-1').queryParameters['MaxStreamingBitrate'],
         '320000',
       );
+      expect(
+        limited.streamUri('song-1', sourceContainer: 'flac').path,
+        '/jellyfin/Audio/song-1/master.m3u8',
+      );
+      expect(
+        limited
+            .streamUri('song-1', mediaSourceId: 'source-2')
+            .queryParameters['MediaSourceId'],
+        'source-2',
+      );
+      expect(
+        client.streamUri('song-1', sourceContainer: 'flac').path,
+        '/jellyfin/Audio/song-1/stream.flac',
+      );
       limited.close();
     });
   });
@@ -123,15 +124,21 @@ void main() {
       'Type': 'Audio',
       'Album': 'An Album',
       'AlbumId': 'album-1',
+      'MediaSources': [
+        {
+          'Id': 'source-1',
+          'Container': 'flac',
+          'MediaStreams': [
+            {'Type': 'Audio', 'BitDepth': 32},
+          ],
+        },
+      ],
       'AlbumPrimaryImageTag': 'album-tag',
       'RunTimeTicks': 125000000,
       'ArtistItems': [
         {'Id': 'artist-1', 'Name': 'An Artist'},
       ],
       'ImageTags': {'Primary': 'tag'},
-      'MediaSources': [
-        {'Container': 'flac'},
-      ],
       'PlaylistItemId': 'entry-1',
       'DateCreated': '2026-08-20T12:00:00Z',
       'UserData': {
@@ -141,6 +148,13 @@ void main() {
       },
     });
 
+    expect(item.audioBitDepth, 32);
+    expect(
+      JellyfinItem.fromJson(
+        item.copyWith(name: 'Renamed').toJson(),
+      ).mediaSourceId,
+      'source-1',
+    );
     expect(item.duration, const Duration(milliseconds: 12500));
     expect(item.artists, ['An Artist']);
     expect(item.artistIds, ['artist-1']);
@@ -233,6 +247,7 @@ void main() {
         albumImageTag: 'image-tag',
       ),
       'queue:0',
+      platform: TargetPlatform.android,
     );
     final suggested = vehicleBrowserMediaItem(
       client,

@@ -62,3 +62,25 @@ Use `flutter run` for the iOS smoke test so the simulator build carries the
 Keychain entitlement; an explicitly unsigned build compiles but cannot read secure storage.
 
 Product and interaction decisions are captured in [DESIGN.md](DESIGN.md).
+
+## Reliability release and acceptance
+
+See [RELEASE_NOTES.md](RELEASE_NOTES.md) and [LAUNCH_RELIABILITY_REPORT.md](LAUNCH_RELIABILITY_REPORT.md) for changes, measured checks, and remaining release gates.
+
+Downloads include durable artwork and collection metadata. Pending/failed jobs survive restarts; jobs continue when the app is reopened, rather than promising OS-scheduled transfers after termination. Settings provides progress, retry/cancel/pause, a Wi-Fi-only policy, storage limits, and bulk removal. Signing out or removing a server deletes that account’s local data. Offline playback reporting is best effort and is not replayed later.
+
+Android release builds require `android/key.properties`, using `android/key.properties.example` and a private, backed-up keystore. Never commit signing material. For compilation checks only, `ORG_GRADLE_PROJECT_allowUnsignedRelease=true flutter build apk --release` produces an unsigned artifact; it is not an installable release. Configure the public support URL with `--dart-define=SUPPORT_URL=https://...` or a `mailto:` address before distribution.
+
+The default `flutter test` suite includes the launch reproductions, persistence, download failures, offline metadata, account cleanup, and a synthetic 50,000-track refresh. Device checks use Flutter’s installed integration-test runner:
+
+```sh
+flutter test integration_test/app_test.dart -d DEVICE_ID
+python3 audit/serve_audio_fixtures.py
+# Android needs: adb -s DEVICE_ID reverse tcp:8765 tcp:8765
+flutter test integration_test/codec_test.dart -d DEVICE_ID
+flutter test integration_test/restart_test.dart -d DEVICE_ID --dart-define=RESTART_STAGE=seed --no-uninstall
+# The test process exits; force-stop it if it is still running. Preserve app data.
+flutter test integration_test/restart_test.dart -d DEVICE_ID --dart-define=RESTART_STAGE=verify
+```
+
+`audit/live_server_test.dart` accepts `SHRIMPHONY_LIVE_SESSION` as a path to a private JSON session file. It temporarily edits one favorite and creates its own test playlist, then restores/deletes only those test changes. Opt-in native live tests accept a private `--dart-define-from-file` JSON object whose `LIVE_SESSION` value is a serialized session. `audit/vehicle_runner.dart` uses the same file for manual native vehicle tests. Never distribute a test artifact containing a session; rebuild the normal `lib/main.dart` entry point without test defines afterward.

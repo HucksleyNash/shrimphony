@@ -1,0 +1,5 @@
+# Copy to key.properties. Never commit the key or its passwords.
+storeFile=/absolute/path/to/your-private-upload-key.jks
+storePassword=
+keyAlias=upload
+keyPassword=
