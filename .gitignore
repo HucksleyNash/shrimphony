@@ -1,53 +1,60 @@
-# Miscellaneous
-*.class
-*.log
-*.pyc
-*.swp
-.DS_Store
-.atom/
-.build/
-.buildlog/
-.history
-.svn/
-.swiftpm/
-migrate_working_dir/
-
-# IntelliJ related
-*.iml
-*.ipr
-*.iws
-.idea/
-
-# The .vscode folder contains launch configuration and tasks you configure in
-# VS Code which you may wish to be included in version control, so this line
-# is commented out by default.
-#.vscode/
-
-# Flutter/Dart/Pub related
-**/doc/api/
-**/ios/Flutter/.last_build_id
+# Flutter and generated build output
 .dart_tool/
+.flutter-plugins
 .flutter-plugins-dependencies
 .pub-cache/
 .pub/
-/build/
-/coverage/
-/.gstack/
-
-# Symbolication related
+build/
+coverage/
+**/doc/api/
+**/ios/Flutter/.last_build_id
+/android/app/debug/
+/android/app/profile/
+/android/app/release/
+*.apk
+*.aab
+*.ipa
+*.dSYM/
+*.xcarchive/
 app.*.symbols
-
-# Obfuscation related
 app.*.map.json
 
-# Android Studio will place build artifacts here
-/android/app/debug
-/android/app/profile
-/android/app/release
+# Private configuration and signing material
+.env
+.env.*
+!.env.example
+!.env.*.example
+.local/
+local_config.json
+key.properties
+*.keystore
+*.jks
+*.p12
+*.pfx
+*.pem
+*.key
+*.mobileprovision
+*.provisionprofile
 
-# Independently versioned website
-/website/
+# Local tooling, logs, and editor state
+.gstack/
+.idea/
+.vscode/*
+!.vscode/launch.json
+*.iml
+*.ipr
+*.iws
+*.log
+*.hprof
+*.class
+*.pyc
+__pycache__/
+*.swp
+*.swo
+.DS_Store
+.build/
+.swiftpm/
+
+# Local audit output and the independently versioned website
 /audit/results/
-/integration_test/local_config.json
-
-/android/build/
+/website/

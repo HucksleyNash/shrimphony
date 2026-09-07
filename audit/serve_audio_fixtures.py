@@ -9,7 +9,7 @@ root = Path(tempfile.mkdtemp(prefix='shrimphony-codecs-'))
 formats = {'mp3': ('mp3', 'libmp3lame'), 'aac': ('aac', 'aac'), 'm4a': ('m4a', 'aac'),
            'alac': ('m4a', 'alac'), 'flac': ('flac', 'flac'), 'flac24': ('flac', 'flac'),
            'flac32': ('flac', 'flac'), 'ogg': ('ogg', 'vorbis'), 'opus': ('opus', 'libopus'), 'wav': ('wav', 'pcm_s16le')}
-ffmpeg = ['/opt/homebrew/bin/ffmpeg', '-v', 'error', '-f', 'lavfi', '-i',
+ffmpeg = ['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i',
           'sine=frequency=440:sample_rate=48000:duration=2', '-af', 'volume=0.01', '-ac', '2', '-strict', 'experimental']
 for name, (extension, codec) in formats.items():
     depth = ['-sample_fmt', 's16'] if name == 'flac' else ['-sample_fmt', 's32', '-bits_per_raw_sample', name[4:]] if name.startswith('flac') else []

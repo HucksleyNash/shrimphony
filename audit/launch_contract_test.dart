@@ -1,5 +1,4 @@
-// Audit reproductions, 2026-09-04. Both expectations describe launch behavior.
-// Run from Shrimphony: flutter test --no-pub <path-to-this-file>
+// Regression checks included by test/reliability_test.dart.
 import 'dart:convert';
 import 'dart:io';
 
@@ -87,8 +86,7 @@ void main() {
       JellyfinSessionStore(supportDirectory: support),
     )..client = client;
     try {
-      // _DetailScreen uses this exact audio subset for Play, Shuffle and
-      // Download all songs; it currently receives only the ten-song preview.
+      // Collection actions must receive every song, including beyond previews.
       final children = await controller.children(
         const JellyfinItem(id: 'artist', name: 'Artist', type: 'MusicArtist'),
       );

@@ -22,10 +22,12 @@ controls, Android Auto, and Apple CarPlay on one audio session.
 
 ## Run locally
 
-Requirements: Flutter 3.44 or newer, Xcode for iOS, and Android Studio/SDK for
-Android.
+Tested with Flutter 3.44.2 / Dart 3.12.2. Android builds require Java 17
+and Android SDK platform 37; iOS builds require macOS and Xcode.
 
 ```sh
+git clone git@github.com:HucksleyNash/shrimphony.git
+cd shrimphony
 flutter pub get
 flutter run
 ```
@@ -65,17 +67,53 @@ Product and interaction decisions are captured in [DESIGN.md](DESIGN.md).
 
 ## Reliability release and acceptance
 
-See [RELEASE_NOTES.md](RELEASE_NOTES.md) and [LAUNCH_RELIABILITY_REPORT.md](LAUNCH_RELIABILITY_REPORT.md) for changes, measured checks, and remaining release gates.
+This is a development build. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for the
+implemented reliability changes and the distribution checklist below. Previous
+local audit reports remain available in Git history.
 
 Downloads include durable artwork and collection metadata. Pending/failed jobs survive restarts; jobs continue when the app is reopened, rather than promising OS-scheduled transfers after termination. Settings provides progress, retry/cancel/pause, a Wi-Fi-only policy, storage limits, and bulk removal. Signing out or removing a server deletes that account’s local data. Offline playback reporting is best effort and is not replayed later.
 
-Android release builds require `android/key.properties`, using `android/key.properties.example` and a private, backed-up keystore. Never commit signing material. For compilation checks only, `ORG_GRADLE_PROJECT_allowUnsignedRelease=true flutter build apk --release` produces an unsigned artifact; it is not an installable release. Configure the public support URL with `--dart-define=SUPPORT_URL=https://...` or a `mailto:` address before distribution.
+## Distribution checklist
+
+1. Copy `android/key.properties.example` to `android/key.properties`, supply a
+   private upload keystore and its passwords, and back up the keystore securely.
+   Release builds refuse missing signing configuration by default.
+2. Select your Apple signing team/profile in Xcode and obtain the CarPlay audio
+   entitlement for `com.thomaskleckner.shrimphony`. Confirm the entitlement in the
+   signed archive and review dependency privacy manifests and store metadata.
+3. Supply a working public support/privacy destination and store installation links.
+   Pass an HTTPS or `mailto:` support address using `--dart-define=SUPPORT_URL=...`.
+4. Complete physical-device acceptance: locked-phone Android Auto/CarPlay and
+   offline cold starts, audio route changes and interruptions, prolonged background
+   playback, gapless playback, full storage, upgrade retention, and screen readers.
+
+After configuring signing and your real support address:
+
+```sh
+flutter build appbundle --release --dart-define=SUPPORT_URL=https://your-domain.example/support
+flutter build ipa --release --dart-define=SUPPORT_URL=https://your-domain.example/support
+```
+
+Outputs are `build/app/outputs/bundle/release/app-release.aab` and `build/ios/ipa/`.
+Use the normal `lib/main.dart` entry point without live-test session defines.
+
+For compilation only:
+
+```sh
+ORG_GRADLE_PROJECT_allowUnsignedRelease=true flutter build appbundle --release
+```
+
+This produces an unsigned bundle, which cannot be submitted as a signed store
+release. Keep the normal dependency step enabled for native builds: `--no-pub`
+can retain debug-only plugin registration when switching to a release build.
+
+## Integration checks
 
 The default `flutter test` suite includes the launch reproductions, persistence, download failures, offline metadata, account cleanup, and a synthetic 50,000-track refresh. Device checks use Flutter’s installed integration-test runner:
 
 ```sh
 flutter test integration_test/app_test.dart -d DEVICE_ID
-python3 audit/serve_audio_fixtures.py
+python3 audit/serve_audio_fixtures.py # requires ffmpeg on PATH; run in a second terminal
 # Android needs: adb -s DEVICE_ID reverse tcp:8765 tcp:8765
 flutter test integration_test/codec_test.dart -d DEVICE_ID
 flutter test integration_test/restart_test.dart -d DEVICE_ID --dart-define=RESTART_STAGE=seed --no-uninstall
@@ -84,3 +122,23 @@ flutter test integration_test/restart_test.dart -d DEVICE_ID --dart-define=RESTA
 ```
 
 `audit/live_server_test.dart` accepts `SHRIMPHONY_LIVE_SESSION` as a path to a private JSON session file. It temporarily edits one favorite and creates its own test playlist, then restores/deletes only those test changes. Opt-in native live tests accept a private `--dart-define-from-file` JSON object whose `LIVE_SESSION` value is a serialized session. `audit/vehicle_runner.dart` uses the same file for manual native vehicle tests. Never distribute a test artifact containing a session; rebuild the normal `lib/main.dart` entry point without test defines afterward.
+
+Keep private live-test JSON files in the ignored `.local/` directory. Environment
+files, signing keys, build artifacts, and local audit output are ignored; dependency
+lockfiles and the signing template are committed.
+
+## Repository layout and CI
+
+- `lib/`: app UI, Jellyfin client/storage, and playback.
+- `android/` and `ios/`: native app projects and vehicle integration.
+- `test/`, `integration_test/`, and `audit/`: automated checks and manual test tools.
+- `assets/` and [DESIGN.md](DESIGN.md): app artwork and product design decisions.
+
+GitHub Actions runs locked dependency resolution, static analysis, the default
+regression suite, and an unsigned Android release bundle build on pushes and pull
+requests. iOS simulator builds and physical-device checks run locally using the
+commands above. CI does not publish store releases.
+
+The local `website/` directory is an independent Git repository and is excluded
+from this app repository. Website deployment is managed separately through its
+existing Sites project; publishing it requires access to that project.
